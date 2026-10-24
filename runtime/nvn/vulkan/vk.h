@@ -99,6 +99,7 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
 VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uint32_t lv0, uint32_t nlv, uint32_t ly0,
                           uint32_t nly, VkComponentMapping sw, VkImageAspectFlags aspect);
 VkImageView vk_dummy_view(int textype);
+VkImageView vk_dummy_depth_view(int textype);  // (depth-compare lookups without a depth texture: exec.c texture_info)
 VkSampler vk_sampler(NvnSamplerDesc *d);
 VkSampler vk_sampler_nearest(NvnSamplerDesc *d);  // (views of integer formats)
 VkSampler vk_default_sampler(bool linear);

@@ -808,6 +808,42 @@ VkImageView vk_dummy_view(int textype) {
     return views[textype];
 }
 
+// A 1x1 depth image at 1.0 for depth-compare lookups that have no depth texture bound (exec.c texture_info): the
+// game binds a small colour texture there when it has no shadow map (a battle: 16x16, format 0x25). The Switch compares
+// against its red channel; Vulkan leaves a compare on a colour format undefined (the validation layer's
+// VUID-vkCmdDrawIndexed-None-06479), so it is this image instead - every lookup lit, as against that white texture.
+VkImageView vk_dummy_depth_view(int textype) {
+    static TexBackend dummies[10];
+    static VkImageView views[10];
+    if (textype < 0 || textype >= 10) textype = TEXTYPE_2D;
+    if (views[textype]) return views[textype];
+    TexBackend *b = &dummies[textype];
+    VkImageViewType vt = view_type_for(textype);
+    if (vt == VK_IMAGE_VIEW_TYPE_3D) return vk_dummy_view(textype);  // (no 3D depth images)
+    bool cube = vt == VK_IMAGE_VIEW_TYPE_CUBE || vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+    VkFormat fmt = VK_FORMAT_D32_SFLOAT;
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(g_vk.phys, fmt, &fp);
+    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) fmt = VK_FORMAT_D16_UNORM;
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0,
+                            .imageType = vt == VK_IMAGE_VIEW_TYPE_1D || vt == VK_IMAGE_VIEW_TYPE_1D_ARRAY ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D,
+                            .format = fmt, .extent = {1, 1, 1}, .mipLevels = 1, .arrayLayers = cube ? 6 : 1,
+                            .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL));
+    VkCommandBuffer cb = vk_upload_cmd();
+    vk_image_init_layout(cb, b->image, VK_IMAGE_ASPECT_DEPTH_BIT);
+    VkClearDepthStencilValue one = {1.0f, 0};
+    VkImageSubresourceRange all = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, cube ? 6 : 1};
+    vkCmdClearDepthStencilImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &all);
+    b->format = fmt;
+    b->levels = 1;
+    b->layers = cube ? 6 : 1;
+    views[textype] = vk_image_view(b, vt, b->format, 0, 1, 0, cube ? 6 : 1, IDENTITY, VK_IMAGE_ASPECT_DEPTH_BIT);
+    return views[textype];
+}
+
 // ================================================================== samplers
 static VkCompareOp compare_op(uint32_t f) {
     switch (f) {

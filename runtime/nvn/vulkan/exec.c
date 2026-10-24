@@ -3284,11 +3284,13 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
     VkImageView view = VK_NULL_HANDLE;
     VkSampler smp = VK_NULL_HANDLE;
+    NvnTexture *tx = NULL;  // (the bound texture, for the depth-compare check below)
     uint32_t tic = h & 0xFFFFF, tsc = (uint32_t)(h >> 20) & 0xFFF;
     sc[0] = sc[1] = 1;
     wh[0] = wh[1] = 0;
     if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
         NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
+        tx = e->tex;
         if (e->tex) {
             // Per-frame memo: ~2400 lookups per overworld frame recomputed the view (format / range math, cache
             // probe). The first lookup of a frame still runs vk_view (upload check); a view that may have been
@@ -3323,6 +3325,9 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
                         rt_kind(((NvnTexEntry *)st.tpool->entries)[tic].tex->format);
         smp = int_view ? vk_sampler_nearest(sd) : vk_sampler(sd);  // (an integer view can't be filtered)
     }
+    // a depth-compare lookup without a depth texture (the game's colour stand-in when it has no shadow map): a depth one
+    // at 1.0 (vk_dummy_depth_view; a compare on a colour format is undefined in Vulkan)
+    if (st_->shadow && (!view || !tx || !renderer_format_is_depth(tx->format))) view = vk_dummy_depth_view(st_->type);
     if (!view) view = vk_dummy_view(st_->type);
     if (!smp) smp = vk_default_sampler(true);
     *out = (VkDescriptorImageInfo){smp, view, VK_IMAGE_LAYOUT_GENERAL};
