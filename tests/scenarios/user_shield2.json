@@ -1,0 +1,2 @@
+{"description": "The player's Shield save in Sword as saved on 14/11 16:21 during the profiled session (where it ran at ~30 fps), standing",
+ "save": "build/scenario-saves/user-shield-2", "input": "600:A:8,800:A:8", "exit_at": 1300, "measure": [700, 1250], "shots": [1250]}
