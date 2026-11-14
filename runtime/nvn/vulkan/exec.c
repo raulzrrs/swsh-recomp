@@ -3559,6 +3559,11 @@ static bool wait_built(_Atomic int *state, void (*fn)(void *), void *arg) {
         if (dt > stat_hold_max_ns) stat_hold_max_ns = dt;
         stat_shader_wait_ns += dt;
         if (atomic_load(state) == 0) stat_hold_timeouts++;
+        if (dt > 50000000) {  // ([hold] what a long one waited for: the hitches left once the shaders are prepared)
+            const char *what = fn == build_compute ? "compute pipeline" : fn == translate_program ? "program translation"
+                             : fn == link_pipeline ? "pipeline link" : fn == build_pipeline ? "whole pipeline" : "?";
+            LOG("[hold] %.0f ms on a %s%s\n", dt / 1e6, what, fn && arg ? "" : " (no job)");
+        }
         return atomic_load(state) != 0;
     }
     extern uint64_t vk_frame_counter(void);
