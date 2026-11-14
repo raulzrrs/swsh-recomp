@@ -1396,6 +1396,28 @@ static float vp_sx = 1, vp_sy = 1, vp_ox = 0, vp_oy = 0;
 static float tex_sc[2][64][2];
 static uint32_t tex_wh[2][64][2];
 
+// ================================================================== SSAO state (ssao_run, below draw_)
+// Ported from Let's Go Recomp (its exec.c ssao_*), placed for Sword's frame: shadow cascades, a depth prepass, the
+// opaque scene into an HDR target with its depth (and a second, multi-target opaque pass on the same two), then the
+// transparent draws on another depth, the bloom chain, the tone mapping and the interface. The scene is the frame's
+// first pass drawing into a scalable float colour target with a depth; its opaque draws (blending off, depth test and
+// write on) are counted and give the projection (vertex constants). The occlusion is computed and multiplied into the
+// HDR colour at the first draw after them that is not the scene's: a pass on other targets, or a draw in the scene
+// without the depth test - after all the opaque geometry, before anything blended or the bloom reads it.
+static struct {
+    bool qual, pending, busy;  // the pass now is the scene's; a non-scene pass after the opaque (run at its first draw)
+    NvnTexture *dtex, *ctex;   // this frame's scene depth and colour target
+    VkImageView cview;
+    VkFormat cfmt;
+    uint32_t cw, ch, opaque;
+    uint64_t frame, done_frame, proj_frame, scan_frame;
+    float proj[4];             // P00, P11, A, B (GL style: z_ndc = (A z + B) / -z)
+    float vp[4];               // the scene draws' viewport in the target's pixels (x, y, w, h): Sword's dynamic resolution
+                               // draws the scene into part of its targets (80% of each side seen)
+    int pbind;                 // where the projection was found: vertex cbuf, byte offset
+    uint32_t poff;
+} ao = {.pbind = -1};
+
 // ================================================================== render passes
 static VkFormat pass_color[8], pass_depth, pass_stencil;
 static uint32_t pass_ncolor, pass_samples = 1, pass_w, pass_h;
@@ -1439,6 +1461,32 @@ static void begin_pass(void) {
         NvnTexture *t0 = st.rt.ncolor ? st.rt.color[0] : NULL;
         gp_mark(cb, "pass: %d color %ux%u fmt %#x, depth %s", st.rt.ncolor, t0 ? t0->width : 0, t0 ? t0->height : 0,
                 t0 ? t0->format : 0, st.rt.depth ? "yes" : "no");
+    }
+    {   // LARECOMP_PASS_LOG=<frame>[,<frame>]: every pass of those presented frames, its targets and the draws of the
+        // one before - the map a scene effect (SSAO) is placed by
+        static const char *pl = (const char *)1;
+        static uint64_t last_draws;
+        if (pl == (const char *)1) pl = getenv("LARECOMP_PASS_LOG");
+        if (pl) {
+            char want[32];
+            snprintf(want, sizeof want, "%llu", (unsigned long long)vk_frame_counter());
+            const char *hit = strstr(pl, want);
+            if (hit && (hit == pl || hit[-1] == ',') && (hit[strlen(want)] == 0 || hit[strlen(want)] == ',')) {
+                char line[700];
+                int n = snprintf(line, sizeof line, "[pass] f%llu prev %llu draws |", (unsigned long long)vk_frame_counter(),
+                                 (unsigned long long)(stat_draws - last_draws));
+                for (int i = 0; i < st.rt.ncolor && n < (int)sizeof line - 80; i++) {
+                    NvnTexture *t = st.rt.color[i];
+                    if (t) n += snprintf(line + n, sizeof line - n, " c%d %ux%ux%u fmt %#x @%llx", i, t->width, t->height, t->depth,
+                                         t->format, (unsigned long long)t->addr);
+                }
+                NvnTexture *d = st.rt.depth;
+                if (d) snprintf(line + n, sizeof line - n, " | d %ux%ux%u fmt %#x @%llx", d->width, d->height, d->depth, d->format,
+                                (unsigned long long)d->addr);
+                LOG("%s\n", line);
+            }
+            last_draws = stat_draws;
+        }
     }
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
     uint32_t w = 0, minw = UINT32_MAX, minh = UINT32_MAX;  // w: first attachment seen
@@ -1515,6 +1563,26 @@ static void begin_pass(void) {
     in_pass = true;
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     stat_passes++;
+    ao.qual = ao.pending = false;
+    if (g_settings.ssao && !ao.busy) {
+        uint64_t fr = vk_frame_counter();
+        if (ao.frame != fr) { ao.frame = fr; ao.opaque = 0; ao.dtex = ao.ctex = NULL; }
+        TexBackend *c0 = pass_ncolor && ca[0].imageView && st.rt.color[0] ? st.rt.color[0]->backend : NULL;
+        VkFormat f = pass_color[0];
+        bool scene = c0 && c0->scalable && has_d && pass_samples == 1 && st.rt.color[0]->width >= 640 &&
+                     (f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || f == VK_FORMAT_R16G16B16A16_SFLOAT || f == VK_FORMAT_R32G32B32A32_SFLOAT);
+        if (scene && ao.opaque < 16 && (ao.dtex != st.rt.depth || ao.ctex != st.rt.color[0])) {
+            ao.dtex = st.rt.depth; ao.ctex = st.rt.color[0]; ao.opaque = 0;  // (the first, or a better candidate)
+        }
+        if (scene && ao.dtex == st.rt.depth && ao.ctex == st.rt.color[0]) {
+            ao.qual = true;
+            ao.cview = ca[0].imageView;
+            ao.cfmt = f;
+            ao.cw = minw; ao.ch = minh;
+        } else if (ao.dtex && ao.opaque >= 16 && ao.done_frame != fr) {
+            ao.pending = true;
+        }
+    }
 }
 
 static void pass_size(int *w, int *h) {
@@ -1565,6 +1633,9 @@ static void set_viewport(float x, float y, float w, float h, float zn, float zf,
     VkViewport vp = neg_y ? (VkViewport){x, y, w, h, fminf(fmaxf(zn, 0), 1), fminf(fmaxf(zf, 0), 1)}
                           : (VkViewport){x, y + h, w, -h, fminf(fmaxf(zn, 0), 1), fminf(fmaxf(zf, 0), 1)};
     vkCmdSetViewport(vk_cmd(), 0, 1, &vp);
+    if (ao.qual) {  // (the SSAO rebuilds positions within the scene's viewport)
+        ao.vp[0] = vp.x, ao.vp[1] = vp.height < 0 ? vp.y + vp.height : vp.y, ao.vp[2] = vp.width, ao.vp[3] = fabsf(vp.height);
+    }
 }
 
 // ================================================================== clears
@@ -4206,6 +4277,284 @@ static void pf_rest_of_list(void) {
 }
 
 static uint64_t prof_tp_;
+// ================================================================== SSAO (Let's Go Recomp's, non-temporal)
+// A GL-style perspective matrix at m (row-major: the rows of P; column-major: its columns): P00, |P11|, A, B.
+static bool ssao_proj_at(const float *m, float out[4]) {
+    if (m[1] == 0 && m[3] == 0 && m[4] == 0 && m[7] == 0 && m[12] == 0 && m[13] == 0 && m[14] == -1 && m[15] == 0 &&
+        m[0] > 0 && m[5] != 0 && m[10] < 0 && m[11] < 0) {
+        out[0] = m[0], out[1] = fabsf(m[5]), out[2] = m[10], out[3] = m[11];
+        return true;
+    }
+    if (m[1] == 0 && m[2] == 0 && m[3] == 0 && m[4] == 0 && m[6] == 0 && m[7] == 0 && m[11] == -1 && m[12] == 0 && m[13] == 0 &&
+        m[15] == 0 && m[0] > 0 && m[5] != 0 && m[10] < 0 && m[14] < 0) {
+        out[0] = m[0], out[1] = fabsf(m[5]), out[2] = m[10], out[3] = m[14];
+        return true;
+    }
+    return false;
+}
+
+// A camera whose view (the 64 bytes before the projection, row-major) does not move the world: a sky's. Not the scene's.
+static bool ssao_cam_at_origin(const float *p, uint32_t off) {
+    if (off < 64) return false;
+    const float *v = p - 16;
+    return fabsf(v[3]) < 1 && fabsf(v[7]) < 1 && fabsf(v[11]) < 1;
+}
+
+// The scene's projection, from the vertex constant buffers of its opaque draws: where it was last found, else a scan
+// (once per frame).
+static void ssao_find_projection(void) {
+    uint64_t fr = vk_frame_counter();
+    if (ao.proj_frame == fr) return;
+    float proj[4];
+    if (ao.pbind >= 0) {
+        Range u = st.ubuf[0][ao.pbind];
+        const uint8_t *blk = (const uint8_t *)(uintptr_t)u.addr;
+        if (blk && ao.poff + 64 <= u.size && ssao_proj_at((const float *)(blk + ao.poff), proj) &&
+            !ssao_cam_at_origin((const float *)(blk + ao.poff), ao.poff)) {
+            memcpy(ao.proj, proj, sizeof ao.proj);
+            ao.proj_frame = fr;
+            return;
+        }
+    }
+    if (ao.scan_frame == fr) return;
+    ao.scan_frame = fr;
+    for (int b = 0; b < 18; b++) {
+        Range u = st.ubuf[0][b];
+        if (!u.addr || u.size < 64) continue;
+        uint64_t n = u.size > 4096 ? 4096 : u.size;
+        for (uint32_t o = 0; o + 64 <= n; o += 16)
+            if (ssao_proj_at((const float *)(uintptr_t)(u.addr + o), proj) && !ssao_cam_at_origin((const float *)(uintptr_t)(u.addr + o), o)) {
+                if (ao.pbind != b || ao.poff != o)
+                    LOG("[ssao] projection in vertex cbuf %d at %u: near %.4g far %.4g (P00 %.3f P11 %.3f)\n", b, o, proj[3] / (proj[2] - 1),
+                        proj[3] / (proj[2] + 1), proj[0], proj[1]);
+                memcpy(ao.proj, proj, sizeof ao.proj);
+                ao.pbind = b, ao.poff = o, ao.proj_frame = fr;
+                return;
+            }
+    }
+}
+
+// The SSAO's passes: a fullscreen triangle into one colour target, up to two inputs (nearest, clamp), 48 bytes of
+// push constants. blend 1: the output multiplies the target's RGB (the occlusion onto the scene).
+static VkPipelineLayout ssao_layout;
+static VkDescriptorSetLayout ssao_set_layout;
+
+static VkPipeline ssao_pipe(const char *fs, VkFormat fmt, int blend) {
+    static struct { const char *fs; VkFormat fmt; int blend; VkPipeline p; } cache[16];
+    for (int i = 0; i < 16; i++) if (cache[i].p && cache[i].fs == fs && cache[i].fmt == fmt && cache[i].blend == blend) return cache[i].p;
+    if (!ssao_layout) {
+        VkDescriptorSetLayoutBinding b[2];
+        for (uint32_t i = 0; i < 2; i++)
+            b[i] = (VkDescriptorSetLayoutBinding){i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = b};
+        VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &ssao_set_layout));
+        VkPushConstantRange r = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64};
+        VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                         .pSetLayouts = &ssao_set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &r};
+        VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &ssao_layout));
+    }
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+         .module = vk_builtin_shader("post.vert"), .pName = "main"},
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+         .module = vk_builtin_shader(fs), .pName = "main"}};
+    VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                 .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkPipelineViewportStateCreateInfo vs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
+    VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                 .polygonMode = VK_POLYGON_MODE_FILL, .lineWidth = 1};
+    VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                               .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineColorBlendAttachmentState cba = {.colorWriteMask = 0xF};
+    if (blend == 1)
+        cba = (VkPipelineColorBlendAttachmentState){.blendEnable = VK_TRUE, .srcColorBlendFactor = VK_BLEND_FACTOR_ZERO,
+                                                    .dstColorBlendFactor = VK_BLEND_FACTOR_SRC_COLOR, .colorBlendOp = VK_BLEND_OP_ADD,
+                                                    .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+                                                    .alphaBlendOp = VK_BLEND_OP_ADD, .colorWriteMask = 0x7};
+    VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1,
+                                              .pAttachments = &cba};
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn};
+    VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1,
+                                        .pColorAttachmentFormats = &fmt};
+    VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 2,
+                                       .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
+                                       .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
+                                       .pColorBlendState = &cb, .pDynamicState = &dy, .layout = ssao_layout};
+    VkPipeline p;
+    VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p));
+    for (int i = 0; i < 16; i++) if (!cache[i].p) { cache[i].fs = fs; cache[i].fmt = fmt; cache[i].blend = blend; cache[i].p = p; break; }
+    return p;
+}
+
+// SSAO image i (0, 1: the occlusion and the blur's ping-pong; 2: a dump) at w x h, RGBA8, kept until the size changes
+static TexBackend *ssao_image(int i, uint32_t w, uint32_t h) {
+    static TexBackend img[3];
+    TexBackend *d = &img[i];
+    if (d->image && (d->width != w || d->height != h)) {
+        vk_views_forget(d);
+        vk_defer_image(d->image, d->mem);
+        d->image = VK_NULL_HANDLE;
+        d->mem = VK_NULL_HANDLE;
+    }
+    if (!d->image) {
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+                                .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
+                                .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL));
+        d->format = VK_FORMAT_R8G8B8A8_UNORM; d->width = w; d->height = h; d->depth = 1; d->layers = 1; d->levels = 1;
+        d->samples = 1; d->aspect = VK_IMAGE_ASPECT_COLOR_BIT; d->base_type = VK_IMAGE_VIEW_TYPE_2D;
+        vk_image_init_layout(vk_cmd(), d->image, d->aspect);
+    }
+    return d;
+}
+
+static VkImageView ssao_view(TexBackend *d) {
+    static const VkComponentMapping id = {0};
+    return vk_image_view(d, VK_IMAGE_VIEW_TYPE_2D, d->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
+}
+
+// One SSAO pass (outside any rendering): srcs -> the view dv (dw x dh); load: keep its contents (the apply's blending)
+static void ssao_pass(VkCommandBuffer cb, VkPipeline pipe, const VkImageView *srcs, int n, VkImageView dv, uint32_t dw, uint32_t dh,
+                      const float pc[16], bool load) {
+    vk_full_barrier(cb);
+    VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = dv,
+                                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                    .loadOp = load ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {dw, dh}},
+                          .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &ca};
+    vkCmdBeginRendering(cb, &ri);
+    VkDescriptorSet ds = vk_alloc_set(ssao_set_layout);
+    VkDescriptorImageInfo ii[2];
+    VkWriteDescriptorSet w[2];
+    for (int i = 0; i < 2; i++) {  // (both bindings written: an unused one gets the first input)
+        ii[i] = (VkDescriptorImageInfo){vk_default_sampler(false), srcs[i < n ? i : 0], VK_IMAGE_LAYOUT_GENERAL};
+        w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = (uint32_t)i,
+                                      .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                      .pImageInfo = &ii[i]};
+    }
+    vkUpdateDescriptorSets(g_vk.dev, 2, w, 0, NULL);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, ssao_layout, 0, 1, &ds, 0, NULL);
+    VkViewport vp = {0, 0, (float)dw, (float)dh, 0, 1};
+    VkRect2D sc = {{0, 0}, {dw, dh}};
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    vkCmdPushConstants(cb, ssao_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64, pc);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRendering(cb);
+    vk_full_barrier(cb);
+}
+
+static float ssao_env(const char *name, float def) {
+    const char *e = getenv(name);
+    return e && *e ? (float)atof(e) : def;
+}
+
+// The occlusion of this frame's scene (its depth, the projection found by its draws), blurred along x and y with
+// the depth as the edges, multiplied into the HDR colour. Outside any pass (the caller ended the scene's).
+static void ssao_run(void) {
+    uint64_t fr = vk_frame_counter();
+    ao.done_frame = fr;
+    TexBackend *d = ao.dtex ? ao.dtex->backend : NULL;
+    static int nolog;
+    if (ao.proj_frame != fr || !d || !d->image || !(d->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || d->samples > 1) {
+        if (nolog < 5 && ao.proj_frame != fr) nolog++, LOG("[ssao] frame %llu: no projection found in the scene's %u opaque draws\n",
+                                                           (unsigned long long)fr, ao.opaque);
+        return;
+    }
+    ao.busy = true;
+    VkCommandBuffer cb = vk_cmd();
+    if (g_gpuprof_frame) gp_mark(cb, "ours: SSAO");
+    static const VkComponentMapping id = {0};
+    VkImageView dv = vk_image_view(d, VK_IMAGE_VIEW_TYPE_2D, d->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT);
+    uint32_t w = d->width, h = d->height;
+    float mo = nvn_depth_mode() == 0 ? 1.0f : 0.0f;
+    VkPipeline p_ao = ssao_pipe("ssao.frag", VK_FORMAT_R8G8B8A8_UNORM, 0), p_blur = ssao_pipe("ssao_blur.frag", VK_FORMAT_R8G8B8A8_UNORM, 0);
+    VkPipeline p_apply = ssao_pipe("ssao_apply.frag", ao.cfmt, 1);
+    TexBackend *a0 = ssao_image(0, w, h), *a1 = ssao_image(1, w, h);
+    static float radius = -1, kint = -1;
+    if (radius < 0) radius = ssao_env("LARECOMP_SSAO_RADIUS", g_settings.ssao_radius), kint = ssao_env("LARECOMP_SSAO_INTENSITY", 1.0f);
+    // the viewport (target pixels) in the depth's pixels (the same size here; scaled in case they differ)
+    float sx = (float)w / (float)(ao.cw ? ao.cw : w), sy = (float)h / (float)(ao.ch ? ao.ch : h);
+    float vx = ao.vp[0] * sx, vy = ao.vp[1] * sy, vw = ao.vp[2] * sx, vh = ao.vp[3] * sy;
+    if (vw < 16 || vh < 16) vx = vy = 0, vw = (float)w, vh = (float)h;
+    float pc[16] = {ao.proj[0], ao.proj[1], ao.proj[2], ao.proj[3], radius, g_settings.ssao_intensity * kint, mo,
+                    0.08f * vh, 0, (float)g_settings.ssao_samples, 0, 0, vx, vy, vw, vh};
+    ssao_pass(cb, p_ao, &dv, 1, ssao_view(a0), w, h, pc, false);
+    float pb[16] = {ao.proj[0], ao.proj[1], ao.proj[2], ao.proj[3], 1, 0, mo, 0, 0, 0, 0, 0, vx, vy, vw, vh};
+    VkImageView bx[2] = {ssao_view(a0), dv};
+    ssao_pass(cb, p_blur, bx, 2, ssao_view(a1), w, h, pb, false);
+    pb[4] = 0, pb[5] = 1;
+    VkImageView by[2] = {ssao_view(a1), dv};
+    ssao_pass(cb, p_blur, by, 2, ssao_view(a0), w, h, pb, false);
+    VkImageView ai[1] = {ssao_view(a0)};
+    // LARECOMP_SSAO_DUMP=<frame>,...: the occlusion as applied -> build/frames/ao_<frame>.png
+    static const char *dump = (const char *)1;
+    if (dump == (const char *)1) dump = getenv("LARECOMP_SSAO_DUMP");
+    for (const char *q = dump; q && *q;) {
+        long at = strtol(q, (char **)&q, 10);
+        if (at == (long)fr) {
+            char path[96];
+            snprintf(path, sizeof path, "build/frames/ao_%05ld.png", at);
+            renderer_save_texture_tex(a0, path);
+            cb = vk_cmd();  // (submitted by the save)
+        }
+        if (*q == ',') q++; else break;
+    }
+    {
+        float pa[16] = {0, 0, 0, 0, 1.0f / (float)ao.cw, 1.0f / (float)ao.ch, 0, 0};
+        ssao_pass(cb, p_apply, ai, 1, ao.cview, ao.cw, ao.ch, pa, true);
+    }
+    static bool logged;
+    if (!logged) {
+        logged = true;
+        LOG("[ssao] scene %ux%u (format %d), depth %ux%u (format %d), viewport %.0f,%.0f %.0fx%.0f, %u opaque draws before it; "
+            "radius %.1f intensity %.2f samples %d\n", ao.cw, ao.ch, (int)ao.cfmt, w, h, (int)d->format, vx, vy, vw, vh, ao.opaque, radius,
+            g_settings.ssao_intensity * kint, g_settings.ssao_samples);
+    }
+    ao.busy = false;
+}
+
+// draw_, right after begin_pass: counts the scene's opaque draws (and finds the projection with them); at the first
+// draw after them that is not the scene's (another pass, or no depth test in the scene) ends the pass and runs the
+// SSAO. true: the caller begins the pass again.
+static bool ssao_draw_hook(void) {
+    uint64_t fr = vk_frame_counter();
+    static int nlog;
+    if (ao.pending) {
+        ao.pending = false;
+        if (nlog < 3) {
+            nlog++;
+            NvnTexture *c = st.rt.ncolor ? st.rt.color[0] : NULL;
+            LOG("[ssao] frame %llu (present %llu): run before a pass on other targets (%d colour, c0 fmt %#x %ux%u @%llx, d @%llx; "
+                "scene c0 @%llx d @%llx), after %u opaque draws, %llu draws in all\n", (unsigned long long)fr,
+                (unsigned long long)renderer_present_count(), st.rt.ncolor, c ? c->format : 0, c ? c->width : 0, c ? c->height : 0,
+                c ? (unsigned long long)c->addr : 0ull, st.rt.depth ? (unsigned long long)st.rt.depth->addr : 0ull,
+                (unsigned long long)ao.ctex->addr, (unsigned long long)ao.dtex->addr, ao.opaque, (unsigned long long)stat_draws);
+        }
+        vk_end_pass();
+        ssao_run();
+        return true;
+    }
+    if (!(st.color_state[0] & 1) && st.ds[0] && st.ds[1]) {
+        ao.opaque++;
+        ssao_find_projection();
+        return false;
+    }
+    if (st.ds[0] || ao.opaque < 16 || ao.done_frame == fr) return false;
+    if (nlog < 3) nlog++, LOG("[ssao] frame %llu: run before a draw without depth test in the scene, after %u opaque draws\n",
+                              (unsigned long long)fr, ao.opaque);
+    vk_end_pass();
+    ssao_run();
+    return true;
+}
+
 static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_tp_ = SDL_GetTicksNS();
     if (!st.program) { SKIP(0); return; }
@@ -4295,6 +4644,7 @@ static void draw_(CmdRec *r, bool indexed) {
     for (int i = 0; i < st.rt.ncolor; i++)
         if (st.rt.color[i] && ((st.channel_mask >> (i * 4)) & 0xF)) snapshots_invalidate(st.rt.color[i]);
     begin_pass();
+    if ((ao.qual || ao.pending) && ssao_draw_hook()) begin_pass();
     VkCommandBuffer cb = vk_cmd();
 
     uint32_t mode = (uint32_t)r->x[0];

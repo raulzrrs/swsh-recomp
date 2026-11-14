@@ -170,8 +170,10 @@ void settings_apply_levels(void) {
     // SwSh Recomp: Let's Go Recomp's SSAO, GI, TAA, FSR 3.1 and frame generation read its own scene passes and motion
     // vectors, not ported (Sword's renderer is another one): off, and SMAA or nothing as the anti-aliasing. A render below
     // the window's size reaches it through FSR 1 (runtime/nvn/vulkan/exec.c post_process), as before.
-    g_settings.ssao_level = g_settings.gi_level = FX_OFF;
-    g_settings.ssao = g_settings.gi = g_settings.contact_on = false;
+    // SSAO is ported (exec.c ssao_run, non-temporal; ultra = high: no contact shadows); GI and the rest stay off.
+    if (g_settings.ssao_level == FX_ULTRA) g_settings.ssao_level = FX_HIGH;
+    g_settings.gi_level = FX_OFF;
+    g_settings.gi = g_settings.contact_on = false;
     if (g_settings.antialias != AA_OFF && g_settings.antialias != AA_SMAA) g_settings.antialias = AA_SMAA;
     g_settings.upscaler_pick = UPSCALE_FSR1;
     g_settings.upscaler = UPSCALE_FSR1;

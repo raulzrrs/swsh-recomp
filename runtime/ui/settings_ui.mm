@@ -493,16 +493,17 @@ void ui_tabs_begin(int *current, int count) {
 }
 
 // ------------------------------------------------------------------ the graphics page
-// (Let's Go Recomp's page also has SSAO, GI, the shadow filter, TAA, FSR 3.1 and frame generation: they read that game's
-// scene passes and motion vectors, not ported to Sword's renderer)
+// (Let's Go Recomp's page also has GI, the shadow filter, TAA, FSR 3.1 and frame generation: they read that game's
+// scene passes and motion vectors, not ported to Sword's renderer; its SSAO is: runtime/nvn/vulkan/exec.c ssao_run)
 static const char *const *graphics_labels(int *n) {
-    static const char *l[5];
+    static const char *l[6];
     l[0] = UI_T("Frame rate", "Taxa de quadros", "Частота кадров");
     l[1] = UI_T("Anti-aliasing", "Antisserrilhado", "Сглаживание");
     l[2] = UI_T("Anisotropic filtering", "Filtro anisotrópico", "Анизотропная фильтрация");
     l[3] = UI_T("Show FPS", "Mostrar FPS", "Показывать FPS");
     l[4] = UI_T("Shadow resolution", "Resolução das sombras", "Разрешение теней");
-    *n = 5;
+    l[5] = UI_T("Ambient occlusion", "Oclusão de ambiente", "Затенение окружения");
+    *n = 6;
     return l;
 }
 
@@ -564,6 +565,18 @@ void ui_page_graphics(float x, bool known) {
                     "O mapa de sombra do sol desenhado 2 ou 4 vezes maior: sombras com bordas mais nítidas e estáveis (o do "
                     "jogo tem 1024 por cascata). 4x usa ~128 MB a mais de memória de vídeo.",
                     "Карта теней солнца в 2 или 4 раза больше: более чёткие края теней. 4x — ещё ~128 МБ видеопамяти."));
+    }
+    {   // (runtime/nvn/vulkan/exec.c ssao_run, live; settings_apply_levels: the samples per level)
+        const char *ao[] = {UI_T("Off", "Desligado", "Выкл."), UI_T("Low", "Baixa", "Низкое"), UI_T("Medium", "Média", "Среднее"),
+                            UI_T("High", "Alta", "Высокое")};
+        int v = g_settings.ssao_level < FX_OFF || g_settings.ssao_level > FX_HIGH ? FX_HIGH : g_settings.ssao_level;
+        ui_row(l[5], x);
+        if (ui_combo("##ssao", &v, ao, 4)) g_settings.ssao_level = v;
+        ui_tip(UI_T("SSAO: soft shading where objects meet and in corners (under characters, along walls, between the "
+                    "houses' details). Low / medium / high: 8 / 12 / 16 samples a pixel.",
+                    "SSAO: sombreado suave onde os objetos se encontram e nos cantos (sob os personagens, junto às paredes, "
+                    "nos detalhes das casas). Baixa / média / alta: 8 / 12 / 16 amostras por pixel.",
+                    "SSAO: мягкое затенение в углах и местах соприкосновения объектов."));
     }
     ui_toggle("##showfps", l[3], x, &g_settings.show_fps);
     ui_tip(UI_T("The frame rate in a corner of the screen.", "A taxa de quadros num canto da tela.", "Частота кадров в углу экрана."));

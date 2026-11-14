@@ -265,7 +265,110 @@ VkDescriptorSetLayout vk_set_layout(const VkBindingInfo *b, int n, uint32_t set,
 }
 
 // ================================================================== built-in shaders
+// A pixel's view-space position (the SSAO's), and with surf its position c and normal n, rebuilt from the depth
+// (Let's Go Recomp's). The depth at binding 0; lin() and pc.a, the projection, declared by the SSAO's common part.
+static const char *vpos_src =
+    "layout(set = 0, binding = 0) uniform sampler2D dep;\n"
+    "ivec2 sz;\n"
+    "vec3 vpos(ivec2 p) {\n"
+    "  p = clamp(p, ivec2(0), sz - 1);\n"
+    "  float l = lin(texelFetch(dep, p, 0).r);\n"
+    "  vec2 ndc = (vec2(p) + 0.5 - pc.d.xy) / pc.d.zw * 2.0 - 1.0;\n"
+    "  return vec3(ndc.x * l / pc.a.x, ndc.y * l / pc.a.y, l);\n"
+    "}\n";
+static const char *surf =
+    "void surface(ivec2 p, out vec3 c, out vec3 n) {\n"
+    "  c = vpos(p);\n"
+    "  vec3 l = vpos(p - ivec2(1, 0)), r = vpos(p + ivec2(1, 0)), u = vpos(p - ivec2(0, 1)), d = vpos(p + ivec2(0, 1));\n"
+    // a pixel whose two neighbours of a direction are both nearer or both farther is no plane (a crack, a seam): the
+    // surface is the neighbours' (else every seam is a thin dark line)
+    "  float tc = 1e-4 * c.z;\n"
+    "  if ((l.z - c.z) * (r.z - c.z) > 0.0 && min(abs(l.z - c.z), abs(r.z - c.z)) > tc) c = (l + r) * 0.5;\n"
+    "  else if ((u.z - c.z) * (d.z - c.z) > 0.0 && min(abs(u.z - c.z), abs(d.z - c.z)) > tc) c = (u + d) * 0.5;\n"
+    "  else {\n"
+    "    vec3 l2 = vpos(p - ivec2(2, 0)), r2 = vpos(p + ivec2(2, 0)), u2 = vpos(p - ivec2(0, 2)), d2 = vpos(p + ivec2(0, 2));\n"
+    "    if ((l2.z - c.z) * (r2.z - c.z) > 0.0 && min(abs(l2.z - c.z), abs(r2.z - c.z)) > tc) { c = (l2 + r2) * 0.5; l = l2; r = r2; }\n"
+    "    else if ((u2.z - c.z) * (d2.z - c.z) > 0.0 && min(abs(u2.z - c.z), abs(d2.z - c.z)) > tc) { c = (u2 + d2) * 0.5; u = u2; d = d2; }\n"
+    "  }\n"
+    "  vec3 dx = abs(r.z - c.z) < abs(c.z - l.z) ? r - c : c - l;\n"
+    "  vec3 dy = abs(d.z - c.z) < abs(c.z - u.z) ? d - c : c - u;\n"
+    "  n = normalize(cross(dx, dy));\n"
+    "  if (dot(n, c) > 0.0) n = -n;\n"
+    "}\n";
+
 static const char *builtin_src(const char *name, int *stage) {
+    // SSAO (exec.c ssao_run): on the scene's depth, between its opaque and its blended draws. a = the game's projection
+    // (P00, P11, A, B: GL style, z_ndc = (A z + B) / -z, so the distance along the view axis is B / (z_ndc + A)); b.z = 1
+    // when depth was stored as (z_ndc + 1) / 2 (NVN's -1..1 mode). b.x = radius (world units), b.y = intensity, b.w = the
+    // largest screen radius in pixels; c.y samples on a spiral turned per pixel (interleaved gradient noise; the blur
+    // evens it out). The blur: 9 taps along b.xy, neighbours more than 4% nearer or farther left out.
+    if (!strcmp(name, "ssao.frag") || !strcmp(name, "ssao_blur.frag")) {
+        *stage = STAGE_FRAGMENT;
+        static const char *common =
+            "#version 450\n"
+            "layout(push_constant) uniform P { vec4 a; vec4 b; vec4 c; vec4 d; } pc;\n"
+            "layout(location = 0) out vec4 o;\n"
+            "float lin(float d) { return pc.a.w / ((pc.b.z > 0.5 ? d * 2.0 - 1.0 : d) + pc.a.z); }\n";
+        static const char *ao =
+            "void main() {\n"
+            "  sz = textureSize(dep, 0);\n"
+            "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+            "  if (texelFetch(dep, p, 0).r >= 0.999999) { o = vec4(1.0); return; }\n"
+            "  vec3 c, n;\n"
+            "  surface(p, c, n);\n"
+            "  float rad = pc.b.x;\n"
+            "  float rpx = min(rad * pc.a.x / c.z * 0.5 * pc.d.z, pc.b.w);\n"
+            "  if (rpx < 1.0) { o = vec4(1.0); return; }\n"
+            "  float ang = 6.2831853 * fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))) + pc.c.x);\n"
+            "  float occ = 0.0, bias = 0.02 * c.z;\n"
+            "  int ns = int(pc.c.y);\n"
+            "  for (int i = 0; i < ns; i++) {\n"
+            "    float t = (float(i) + 0.5) / float(ns), a = ang + float(i) * 2.39996323;\n"
+            "    vec3 v = vpos(p + ivec2(vec2(cos(a), sin(a)) * (t * rpx + 1.0))) - c;\n"
+            "    float vv = dot(v, v);\n"
+            "    float cosv = (dot(v, n) - bias) * inversesqrt(vv + 1e-3);\n"
+            "    occ += max(cosv, 0.0) * clamp(1.0 - vv / (rad * rad), 0.0, 1.0);\n"
+            "  }\n"
+            "  o = vec4(vec3(clamp(1.0 - pc.b.y * occ * (2.0 / float(ns)), 0.0, 1.0)), 1.0);\n"
+            "}\n";
+        static const char *blur =
+            "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+            "layout(set = 0, binding = 1) uniform sampler2D dep;\n"
+            "void main() {\n"
+            "  ivec2 sz = textureSize(t, 0), p = ivec2(gl_FragCoord.xy);\n"
+            "  float l0 = lin(texelFetch(dep, p, 0).r), s = 0.0, w = 0.0;\n"
+            "  for (int i = -4; i <= 4; i++) {\n"
+            "    ivec2 q = clamp(p + ivec2(pc.b.xy * float(i)), ivec2(0), sz - 1);\n"
+            "    float dl = abs(lin(texelFetch(dep, q, 0).r) - l0) / (0.04 * l0);\n"
+            "    float k = exp(-float(i * i) / 10.0) * max(1.0 - dl, 0.0);\n"
+            "    s += texelFetch(t, q, 0).r * k; w += k;\n"
+            "  }\n"
+            "  o = vec4(vec3(w > 0.0 ? s / w : texelFetch(t, p, 0).r), 1.0);\n"
+            "}\n";
+        static char *src[2];
+        int k = !strcmp(name, "ssao_blur.frag");
+        if (!src[k]) {
+            const char *body = k ? blur : ao, *pre = k ? "" : vpos_src, *pre2 = k ? "" : surf;
+            size_t n = strlen(common) + strlen(pre) + strlen(pre2) + strlen(body) + 1;
+            src[k] = malloc(n);
+            snprintf(src[k], n, "%s%s%s%s", common, pre, pre2, body);
+        }
+        return src[k];
+    }
+    // The occlusion onto the scene, multiplied by the pipeline's blending (exec.c ssao_pipe blend 1). b.xy = 1 / the
+    // output's size (the occlusion is at the depth's size: sampled at the pixel's place).
+    if (!strcmp(name, "ssao_apply.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; vec4 c; vec4 d; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() {\n"
+               "  ivec2 sz = textureSize(t, 0);\n"
+               "  float a = texelFetch(t, clamp(ivec2(gl_FragCoord.xy * pc.b.xy * vec2(sz)), ivec2(0), sz - 1), 0).r;\n"
+               "  o = vec4(vec3(a), 1.0);\n"
+               "}\n";
+    }
     if (!strcmp(name, "present.vert")) {
         *stage = STAGE_VERTEX;
         // pv[0].x: flip (lower-left origin), pv[1]: uv crop (origin, size). Fullscreen triangle; Vulkan NDC y points down.
