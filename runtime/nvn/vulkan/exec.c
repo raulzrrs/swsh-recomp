@@ -1442,6 +1442,10 @@ static void begin_pass(void) {
     }
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
     uint32_t w = 0, minw = UINT32_MAX, minh = UINT32_MAX;  // w: first attachment seen
+    if (st.rt.depth && renderer_format_is_depth(st.rt.depth->format)) {  // (the shadow map at its own scale: textures.c)
+        extern void vk_tex_shadow_pair(NvnTexture *depth, NvnTexture *color);
+        for (int i = 0; i < st.rt.ncolor; i++) vk_tex_shadow_pair(st.rt.depth, st.rt.color[i]);
+    }
     pass_ncolor = (uint32_t)st.rt.ncolor;
     pass_samples = 1;
     for (int i = 0; i < st.rt.ncolor; i++) {

@@ -161,6 +161,25 @@ static bool tex_scalable(const NvnTexture *t) {
     return a > 1.74f && a < 1.81f;
 }
 
+// The sun's shadow map drawn larger (ported from Let's Go Recomp c63ff85, after TotK Recomp's shadow_scale): a square
+// depth render target of 1024 - 2048 is allocated K times as large on each side; its passes' viewports follow sx / sy
+// as the scaled targets' do, and the lookups are in texture coordinates, so the scene reads it unchanged. Sharper,
+// steadier shadow edges. g_settings.shadow_res (1, 2 or 4; LARECOMP_SHADOW_SCALE=<k> overrides it). A change
+// reallocates the map (tex_backend).
+static float shadow_k(void) {
+    static int env = -2;
+    if (env == -2) env = getenv("LARECOMP_SHADOW_SCALE") ? atoi(getenv("LARECOMP_SHADOW_SCALE")) : -1;
+    int k = env > 0 ? env : g_settings.shadow_res;
+    return k >= 4 ? 4.0f : k >= 2 ? 2.0f : 1.0f;
+}
+// (Let's Go: one 2048x2048 map, 2D. Sword and Shield: a 1024x1024 2D array of 2 layers, the sun's two cascades - near
+// and far -, so arrays of up to 4 layers count too; every layer is scaled, the layer count stays.)
+static bool tex_shadow(const NvnTexture *t) {
+    bool layers_ok = t->target == 1 || (t->target == 4 && t->depth >= 1 && t->depth <= 4);
+    return layers_ok && t->samples <= 1 && (t->flags & 8) && renderer_format_is_depth(t->format) && t->width == t->height &&
+           t->width >= 1024 && t->width <= 2048 && t->levels <= 1;
+}
+
 bool renderer_texture_first_write(NvnTexture *t) {
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
     uint64_t total_frames = renderer_present_count();
@@ -239,8 +258,8 @@ void vk_collect_dead(void) {
 
 static void create_image(NvnTexture *t, TexBackend *b) {
     VkFmt mf = fmt_of(t->format);
-    b->sx = b->scalable ? g_rs_x : 1;
-    b->sy = b->scalable ? g_rs_y : 1;
+    b->sx = b->scalable ? (b->shadow ? shadow_k() : g_rs_x) : 1;
+    b->sy = b->scalable ? (b->shadow ? shadow_k() : g_rs_y) : 1;
     uint32_t tw = t->width ? t->width : 1, th = t->height ? t->height : 1;
     if (b->scalable) {
         tw = (uint32_t)lroundf(tw * b->sx); th = (uint32_t)lroundf(th * b->sy);
@@ -371,7 +390,8 @@ static void live_remove(TexBackend *b) {
 static TexBackend *tex_backend(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (b) {
-        if (b->scalable && (b->sx != g_rs_x || b->sy != g_rs_y)) {  // output resolution changed: reallocate
+        float kx = b->shadow ? shadow_k() : g_rs_x, ky = b->shadow ? shadow_k() : g_rs_y;
+        if (b->scalable && (b->sx != kx || b->sy != ky)) {  // output resolution (or shadow map scale) changed: reallocate
             destroy_image(b);
             create_image(t, b);
         }
@@ -380,7 +400,13 @@ static TexBackend *tex_backend(NvnTexture *t) {
     vk_collect_dead();
     b = calloc(1, sizeof *b);
     b->scalable = tex_scalable(t);
+    if (!b->scalable && tex_shadow(t)) b->scalable = b->shadow = true;
     create_image(t, b);
+    if (b->shadow) { LOG("[vk] shadow map %ux%u fmt %#x at %llx flags %#x: drawn at %ux%u\n", t->width, t->height, t->format,
+                       (unsigned long long)t->addr, t->flags, b->width, b->height); }
+    else if (renderer_format_is_depth(t->format) && t->width == t->height && t->width >= 512) {
+        LOG("[vk] square depth texture %ux%u fmt %#x at %llx flags %#x target %u levels %u depth %u: not a shadow map\n", t->width,
+            t->height, t->format, (unsigned long long)t->addr, t->flags, t->target, t->levels, t->depth); }
     t->backend = b;
     live_add(t, b);
     return b;
@@ -389,6 +415,23 @@ static TexBackend *tex_backend(NvnTexture *t) {
 // A texture the game fills from memory (CopyBufferToTexture) holds full-size data, so it can't live at the scaled
 // output resolution: Let's Go's movie planes (R8 1920x1080 / RG8 960x540, 16:9 render-target flags) were scaled to
 // the window and the full-size copies overran them (device lost). Such a texture stays at its own size from then on.
+// A pass drawing into the scaled shadow map with a colour target of the same size: the pass's size is its first
+// attachment's, so that target is scaled with the map, or the map was drawn into a quarter of itself (no shadows at
+// 2x). Called by exec.c begin_pass before the attachments' views.
+void vk_tex_shadow_pair(NvnTexture *depth, NvnTexture *color) {
+    if (!depth || !color || color == depth) return;
+    TexBackend *d = tex_backend(depth);
+    if (!d->shadow) return;
+    TexBackend *c = tex_backend(color);
+    if (c->scalable || color->target != 1 || color->samples > 1 || color->width != depth->width || color->height != depth->height)
+        return;
+    c->scalable = c->shadow = true;
+    LOG("[vk] texture %ux%u fmt %#x at %llx: the shadow map's colour target, scaled with it\n", color->width, color->height,
+        color->format, (unsigned long long)color->addr);
+    destroy_image(c);
+    create_image(color, c);
+}
+
 void vk_tex_unscale(NvnTexture *t) {
     TexBackend *b = tex_backend(t);
     if (!b->scalable) return;

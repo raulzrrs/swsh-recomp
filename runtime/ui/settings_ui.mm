@@ -496,12 +496,13 @@ void ui_tabs_begin(int *current, int count) {
 // (Let's Go Recomp's page also has SSAO, GI, the shadow filter, TAA, FSR 3.1 and frame generation: they read that game's
 // scene passes and motion vectors, not ported to Sword's renderer)
 static const char *const *graphics_labels(int *n) {
-    static const char *l[4];
+    static const char *l[5];
     l[0] = UI_T("Frame rate", "Taxa de quadros", "Частота кадров");
     l[1] = UI_T("Anti-aliasing", "Antisserrilhado", "Сглаживание");
     l[2] = UI_T("Anisotropic filtering", "Filtro anisotrópico", "Анизотропная фильтрация");
     l[3] = UI_T("Show FPS", "Mostrar FPS", "Показывать FPS");
-    *n = 4;
+    l[4] = UI_T("Shadow resolution", "Resolução das sombras", "Разрешение теней");
+    *n = 5;
     return l;
 }
 
@@ -551,6 +552,18 @@ void ui_page_graphics(float x, bool known) {
                     "Mantém as texturas nítidas vistas de lado (caminhos, grama no horizonte). Quase de graça numa GPU "
                     "dedicada. Vale na próxima vez que o jogo abrir.",
                     "Сохраняет чёткость текстур под острым углом. Применяется при следующем запуске."));
+    }
+    {   // (runtime/nvn/vulkan/textures.c shadow_k: the map is reallocated at once)
+        const char *sr[] = {UI_T("The game's", "Do jogo", "Как в игре"), "2x", "4x"};
+        static const int lv[] = {1, 2, 4};
+        int v = g_settings.shadow_res >= 4 ? 2 : g_settings.shadow_res >= 2 ? 1 : 0;
+        ui_row(l[4], x);
+        if (ui_combo("##shadowres", &v, sr, 3)) g_settings.shadow_res = lv[v];
+        ui_tip(UI_T("The sun's shadow map drawn 2 or 4 times as large: shadows with sharper, steadier edges (the game's "
+                    "is 1024 per cascade). 4x uses ~128 MB more video memory.",
+                    "O mapa de sombra do sol desenhado 2 ou 4 vezes maior: sombras com bordas mais nítidas e estáveis (o do "
+                    "jogo tem 1024 por cascata). 4x usa ~128 MB a mais de memória de vídeo.",
+                    "Карта теней солнца в 2 или 4 раза больше: более чёткие края теней. 4x — ещё ~128 МБ видеопамяти."));
     }
     ui_toggle("##showfps", l[3], x, &g_settings.show_fps);
     ui_tip(UI_T("The frame rate in a corner of the screen.", "A taxa de quadros num canto da tela.", "Частота кадров в углу экрана."));

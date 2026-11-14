@@ -49,6 +49,7 @@ Settings g_settings = {
     .movie_audio = true,
     .show_fps = false,
     .aniso = 16,
+    .shadow_res = 2,  // (2x: no measured cost on an RTX 3080 at 1440p60)
     .render_thread = true,
     .vertex_read = VREAD_AUTO,
     .upscaler = UPSCALE_SHARP,
@@ -93,6 +94,7 @@ static void parse_line(const char *line) {
     else if (!strcmp(key, "reverb")) g_settings.reverb = atoi(val) != 0;
     else if (!strcmp(key, "movie_audio")) g_settings.movie_audio = atoi(val) != 0;
     else if (!strcmp(key, "show_fps")) g_settings.show_fps = atoi(val) != 0;
+    else if (!strcmp(key, "shadow_res")) { int k = atoi(val); g_settings.shadow_res = k >= 4 ? 4 : k >= 2 ? 2 : 1; }
     else if (!strcmp(key, "aniso")) { int a = atoi(val); g_settings.aniso = a >= 16 ? 16 : a >= 8 ? 8 : a >= 4 ? 4 : a >= 2 ? 2 : 0; }
     else if (!strcmp(key, "resolution")) {
         int n = atoi(val);
@@ -246,6 +248,7 @@ void settings_save(void) {
     fprintf(f, "movie_audio = %d\n", g_settings.movie_audio);
     fprintf(f, "show_fps = %d\n", g_settings.show_fps);
     fprintf(f, "aniso = %d\n", g_settings.aniso);
+    fprintf(f, "shadow_res = %d\n", g_settings.shadow_res);
     if (g_settings.res_mode == RES_DYNAMIC) fprintf(f, "resolution = dynamic\n");
     else if (g_settings.res_mode == RES_Q75) fprintf(f, "resolution = 75%%\n");
     else if (g_settings.res_mode == RES_Q25) fprintf(f, "resolution = 25%%\n");

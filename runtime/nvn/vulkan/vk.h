@@ -80,6 +80,7 @@ typedef struct TexBackend {
     bool gpu_owned, uploaded, dynamic;
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
     bool scalable, presented;
+    bool shadow;  // scalable as a shadow map (textures.c tex_shadow): sx = sy = the shadow map scale, not the output's
     uint64_t touched_frame, frame_cleared;
     uint32_t level_gen;
     float sx, sy;
