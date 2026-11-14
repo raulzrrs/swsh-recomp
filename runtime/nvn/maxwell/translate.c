@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "shader.h"
+#include "settings.h"  // (g_settings.pcss: maxwell_pcss_k)
 
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
 const uint8_t *maxwell_dbg_code;
@@ -60,6 +61,11 @@ typedef struct {
     ShaderInfo *info;
     Str body;
     uint8_t reg_used[256];
+    // PCSS (glsl_sample shpcf_c): writes per register so far, and for a register an FFMA wrote last, the register it
+    // added (the shadow taps' centre: tap = offset * radius + centre) and that register's write count at the time
+    uint32_t wcnt[256];
+    int16_t fma_c[256];  // -1: the last write was not such an FFMA
+    uint32_t fma_c_cnt[256];
     uint8_t pred_used[8];
     uint32_t in_attr_mask, out_attr_mask;
     uint32_t vs_in_comp[32];
@@ -104,9 +110,14 @@ static uint32_t norm_target(int64_t t) {
 // ------------------------------------------------------------------ operands
 static const char *reg(Ctx *c, int r, char *buf) {
     if (r == RZ) return "0u";
-    c->reg_used[r] = 1;
+    c->reg_used[r] = 1;  // (a read: declared, not a write)
     sprintf(buf, "r%d", r);
     return buf;
+}
+
+static void mark_w(Ctx *c, int r) {  // (a register written: declared, its write count, no longer a shadow tap's FFMA)
+    c->reg_used[r] = 1;
+    if (r >= 0 && r < 256) c->wcnt[r]++, c->fma_c[r] = -1;
 }
 
 #define R(r) reg(c, (r), alloca(16))
@@ -169,7 +180,7 @@ static const char *operand_c_for_ffma(Ctx *c, uint64_t w, char *buf, const char 
 
 static void set_reg(Ctx *c, int r, const char *expr) {
     if (r == RZ) return;
-    c->reg_used[r] = 1;
+    mark_w(c, r);
     sp(&c->body, "    r%d = %s;\n", r, expr);
 }
 
@@ -314,7 +325,7 @@ static void hstore(Ctx *c, int d, const char *expr, int merge, bool sat) {
     char t[2048], e[1700];
     if (sat) sprintf(e, "saturate(%s)", expr); else strcpy(e, expr);
     if (d == RZ) return;
-    c->reg_used[d] = 1;
+    mark_w(c, d);
     sprintf(t, "hpack(%s, %du, r%d)", e, merge, d);
     set_reg(c, d, t);
 }
@@ -436,7 +447,7 @@ static bool emit_half(Ctx *c, uint64_t w) {
         } else {
             bool bf = bits(w, 49, 1);
             if (d != RZ) {
-                c->reg_used[d] = 1;
+                mark_w(c, d);
                 sp(&c->body, "      l = l %s pp; h = h %s pp;\n", bool_op(bop), bool_op(bop));
                 sp(&c->body, bf ? "      r%d = (l ? 0x3c00u : 0u) | (h ? 0x3c000000u : 0u);\n"
                                 : "      r%d = (l ? 0xFFFFu : 0u) | (h ? 0xFFFF0000u : 0u);\n", d);
@@ -503,8 +514,8 @@ static void write_tex_result(Ctx *c, int slot, const char *call, uint32_t mask, 
         char v[4][16];
         for (int i = 0; i < 4; i++) { if (i < n) sprintf(v[i], "t[%d]", comps[i]); else strcpy(v[i], "0.0f"); }
         const char *pk = c->glsl ? "      r%d = packHalf2x16(vec2(%s, %s));\n" : "      r%d = as_type<uint>(half2(half(%s), half(%s)));\n";
-        if (d0 != RZ) { c->reg_used[d0] = 1; sp(&c->body, pk, d0, v[0], v[1]); }
-        if (d1 != RZ) { c->reg_used[d1] = 1; sp(&c->body, pk, d1, v[2], v[3]); }
+        if (d0 != RZ) { mark_w(c, d0); sp(&c->body, pk, d0, v[0], v[1]); }
+        if (d1 != RZ) { mark_w(c, d1); sp(&c->body, pk, d1, v[2], v[3]); }
         sp(&c->body, "    }\n");
         return;
     }
@@ -519,7 +530,7 @@ static void write_tex_result(Ctx *c, int slot, const char *call, uint32_t mask, 
     for (int comp = 0; comp < 4; comp++) {
         if (!(mask & (1u << comp))) continue;
         int r = regs[n++];
-        if (r != RZ) { c->reg_used[r] = 1; sp(&c->body, "      r%d = as_type<uint>(t[%d]);\n", r, comp); }
+        if (r != RZ) { mark_w(c, r); sp(&c->body, "      r%d = as_type<uint>(t[%d]);\n", r, comp); }
     }
     sp(&c->body, "    }\n");
 }
@@ -598,6 +609,25 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
     }
     char e[2000], ex[300] = "";
     if (extra) snprintf(ex, sizeof ex, ", %s", extra);
+    // PCSS (ported from Let's Go Recomp 69a032f, after TotK Recomp's translator patch 0010): the game spreads its shadow
+    // taps around a centre (Sword: x = offset * radius + centre, 10 taps a pixel, the centre still in its registers at
+    // the lookup); when both coordinates come straight from such an FFMA and the centres were not written since,
+    // shpcf_c / shpcfa_c (2D array: the sun's cascades) get the centre and scale the spread by the distance to the
+    // blockers. Fragment shaders, implicit lod, 2D or 2D array maps only.
+    if (t->shadow && c->stage == STAGE_FRAGMENT && lod_kind == 0 && !off && maxwell_pcss_k() != 0.0f &&
+        (type == TEXTYPE_2D || type == TEXTYPE_2D_ARRAY)) {
+        int rx = -1, ry = -1, k1 = 0, k2 = 0;
+        if (sscanf(co[0], "as_type<float>(r%d)%n", &rx, &k1) == 1 && !co[0][k1] && sscanf(co[1], "as_type<float>(r%d)%n", &ry, &k2) == 1 &&
+            !co[1][k2] && rx >= 0 && rx < 255 && ry >= 0 && ry < 255 && c->fma_c[rx] >= 0 && c->fma_c[ry] >= 0 &&
+            c->wcnt[c->fma_c[rx]] == c->fma_c_cnt[rx] && c->wcnt[c->fma_c[ry]] == c->fma_c_cnt[ry]) {
+            bool arr = type == TEXTYPE_2D_ARRAY;
+            c->info->uses_pcss |= arr ? 2 : 1;
+            snprintf(e, sizeof e, "%s(t%d, %s, vec2(as_type<float>(r%d), as_type<float>(r%d)))", arr ? "shpcfa_c" : "shpcf_c", slot, P,
+                     c->fma_c[rx], c->fma_c[ry]);
+            sprintf(out, "vec4(%s)", e);
+            return;
+        }
+    }
     if (lod_kind == 0) snprintf(e, sizeof e, "texture(t%d, %s%s)", slot, P, ex);
     else if (lod_kind == 1) snprintf(e, sizeof e, "textureLod(t%d, %s%s, %s)", slot, P, ex, lod);
     else snprintf(e, sizeof e, "texture(t%d, %s%s, %s)", slot, P, ex, lod);
@@ -942,7 +972,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             }
             int n = 0;
             for (int i = 0; i < 4; i++)
-                if (mask & (1u << i)) { c->reg_used[d + n] = 1; sp(&c->body, "      r%d = q[%d];\n", d + n, i); n++; }
+                if (mask & (1u << i)) { mark_w(c, d + n); sp(&c->body, "      r%d = q[%d];\n", d + n, i); n++; }
             sp(&c->body, "    }\n");
         } else if (qt == 1) {  // dimension
             if (c->stage != STAGE_VERTEX) {  // report the guest size of scaled allocations
@@ -956,7 +986,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             }
             int n = 0;
             for (int i = 0; i < 4; i++)
-                if (mask & (1u << i)) { c->reg_used[d + n] = 1; sp(&c->body, "      r%d = q[%d];\n", d + n, i); n++; }
+                if (mask & (1u << i)) { mark_w(c, d + n); sp(&c->body, "      r%d = q[%d];\n", d + n, i); n++; }
             sp(&c->body, "    }\n");
         } else {
             fail(c, "txq type %d", qt);
@@ -992,7 +1022,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                slot, slot, mv, co, slot, slot, mv, co);
         int n = 0;
         for (int i = 0; i < 2; i++)
-            if (mask & (1u << i)) { c->reg_used[d + n] = 1; sp(&c->body, "      r%d = uint(int(lq[%d] * 256.0f));\n", d + n, i); n++; }
+            if (mask & (1u << i)) { mark_w(c, d + n); sp(&c->body, "      r%d = uint(int(lq[%d] * 256.0f));\n", d + n, i); n++; }
         sp(&c->body, "    }\n");
     } else if (OPM(0x5080000000000000ull, 0xfff8000000000000ull)) {  // MUFU
         int fn = (int)bits(w, 20, 4);
@@ -1056,6 +1086,12 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         else
             sprintf(t, "fma(%s, %s, %s)", fa, fb, fc);
         set_reg(c, d, FRES(t, bits(w, 50, 1)));
+        {   // (PCSS: d = a * b + a register c, unnegated and unsaturated - a shadow tap around a centre, glsl_sample)
+            uint64_t op8 = w >> 56;
+            int cr = (int)bits(w, 39, 8);
+            if (d != RZ && cr != RZ && op8 != 0x51 && !bits(w, 49, 1) && !bits(w, 50, 1) && bits(w, 53, 2) < 2)
+                c->fma_c[d] = (int16_t)cr, c->fma_c_cnt[d] = c->wcnt[cr];
+        }
     } else if (OPM(0x0c00000000000000ull, 0xfc00000000000000ull)) {  // FFMA32I
         sprintf(u, "as_type<float>(0x%08xu)", (uint32_t)bits(w, 20, 32));
         char fa[512], fc[512];
@@ -1179,7 +1215,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         if (bits(w, 47, 1)) {
             sp(&c->body, "    { uint s = %s%s; uint t2 = %s%s; uint res = s + t2%s; cc = (res < s) ? 1u : 0u;\n", bits(w, 49, 1) ? "-" : "",
                R(a), bits(w, 48, 1) ? "-" : "", B(false), bits(w, 43, 1) ? " + cc" : "");
-            if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = res;\n", d); }
+            if (d != RZ) { mark_w(c, d); sp(&c->body, "      r%d = res;\n", d); }
             sp(&c->body, "    }\n");
         } else {
             set_reg(c, d, t);
@@ -1189,7 +1225,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         if (wcc || x) c->uses_cc = true;
         sp(&c->body, "    { ulong sum = ulong(%s%s) + ulong(0x%08xu)%s;%s\n", bits(w, 56, 1) ? "-" : "", R(a), (uint32_t)bits(w, 20, 32),
            x ? " + ulong(cc)" : "", wcc ? " cc = uint(sum >> 32) & 1u;" : "");
-        if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = uint(sum);\n", d); }
+        if (d != RZ) { mark_w(c, d); sp(&c->body, "      r%d = uint(sum);\n", d); }
         sp(&c->body, "    }\n");
     } else if (OPM(0x5cc0000000000000ull, 0xfff0000000000000ull) || OPM(0x4cc0000000000000ull, 0xfff0000000000000ull) ||
                OPM(0x38c0000000000000ull, 0xfef0000000000000ull)) {  // IADD3
@@ -1199,7 +1235,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             sp(&c->body, "    { ulong sum = ulong(%s%s) + ulong(%s%s) + ulong(%s%s)%s;\n", bits(w, 51, 1) ? "-" : "", R(a),
                bits(w, 50, 1) ? "-" : "", B(false), bits(w, 49, 1) ? "-" : "", R((int)bits(w, 39, 8)), x3 ? " + ulong(cc)" : "");
             if (wcc3) sp(&c->body, "      cc = uint(sum >> 32) & 1u;\n");
-            if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = uint(sum);\n", d); }
+            if (d != RZ) { mark_w(c, d); sp(&c->body, "      r%d = uint(sum);\n", d); }
             sp(&c->body, "    }\n");
         } else {
             sprintf(t, "(%s%s + %s%s + %s%s)", bits(w, 51, 1) ? "-" : "", R(a), bits(w, 50, 1) ? "-" : "", B(false),
@@ -1214,7 +1250,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             c->uses_cc = true;
             sp(&c->body, "    { uint s = %s%s << %du; uint t2 = %s%s; uint res = s + t2; cc = (res < s) ? 1u : 0u;\n",
                bits(w, 49, 1) ? "-" : "", R(a), (int)bits(w, 39, 5), bits(w, 48, 1) ? "-" : "", B(false));
-            if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = res;\n", d); }
+            if (d != RZ) { mark_w(c, d); sp(&c->body, "      r%d = res;\n", d); }
             sp(&c->body, "    }\n");
         } else {
             set_reg(c, d, t);
@@ -1273,7 +1309,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             c->pred_used[pd] = 1;
             int pop = (int)bits(w, 44, 2);
             sp(&c->body, "    { uint res = %s;\n", t);
-            if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = res;\n", d); }
+            if (d != RZ) { mark_w(c, d); sp(&c->body, "      r%d = res;\n", d); }
             sp(&c->body, "      p%d = %s; }\n", pd, pop == 2 ? "(res == 0u)" : pop == 3 ? "(res != 0u)" : pop == 1 ? "true" : "false");
         } else {
             set_reg(c, d, t);
@@ -1366,7 +1402,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         else sp(&c->body, "      uint res = prod + cc_;\n");
         if (wcc) sp(&c->body, "      cc = (res < prod) ? 1u : 0u;\n");
         if (mrg) sp(&c->body, "      res = (res & 0xFFFFu) | (xbu << 16);\n");
-        if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = res;\n", d); }
+        if (d != RZ) { mark_w(c, d); sp(&c->body, "      r%d = res;\n", d); }
         sp(&c->body, "    }\n");
     } else if (OPM(0x5090000000000000ull, 0xfff8000000000000ull)) {  // PSETP
         const char *pa = P((int)bits(w, 12, 3), bits(w, 15, 1)), *pb = P((int)bits(w, 29, 3), bits(w, 32, 1));
@@ -1470,7 +1506,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         else if (right) sprintf(t, "uint(v >> s)");
         else if (width == 64) sprintf(t, "s >= 64u ? 0u : uint((v << s) >> 32)");
         else sprintf(t, "uint((v << s) >> 32)");
-        if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = %s;\n", d, t); }
+        if (d != RZ) { mark_w(c, d); sp(&c->body, "      r%d = %s;\n", d, t); }
         sp(&c->body, "    }\n");
     } else if (OPM(0xeed0000000000000ull, 0xfff8000000000000ull) || OPM(0xeed8000000000000ull, 0xfff8000000000000ull)) {  // LDG / STG
         bool store = bits(w, 51, 1);
@@ -1495,11 +1531,11 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                 "uint(sx16(gmem_.w[uint(ga >> 2)] >> (uint(ga & 2ul) * 8u)))"};
             if (!store) {
                 if (size < 4) {
-                    if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      if (ok) r%d = %s; else r%d = 0u;\n", d, gl_small[size], d); }
+                    if (d != RZ) { mark_w(c, d); sp(&c->body, "      if (ok) r%d = %s; else r%d = 0u;\n", d, gl_small[size], d); }
                 } else {
                     for (int k = 0; k < nw; k++)
                         if (d != RZ && d + k < RZ) {
-                            c->reg_used[d + k] = 1;
+                            mark_w(c, d + k);
                             sp(&c->body, "      if (ok) r%d = gmem_.w[uint(ga >> 2) + %du]; else r%d = 0u;\n", d + k, k, d + k);
                         }
                 }
@@ -1516,10 +1552,10 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             }
         } else if (!store) {
             if (size < 4) {
-                if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = ok ? %s : 0u;\n", d, ld_small[size]); }
+                if (d != RZ) { mark_w(c, d); sp(&c->body, "      r%d = ok ? %s : 0u;\n", d, ld_small[size]); }
             } else {
                 for (int k = 0; k < nw; k++)
-                    if (d != RZ && d + k < RZ) { c->reg_used[d + k] = 1; sp(&c->body, "      r%d = ok ? *(device uint *)(gmem + ga + %du) : 0u;\n", d + k, k * 4); }
+                    if (d != RZ && d + k < RZ) { mark_w(c, d + k); sp(&c->body, "      r%d = ok ? *(device uint *)(gmem + ga + %du) : 0u;\n", d + k, k * 4); }
             }
         } else {
             if (size == 0 || size == 1) sp(&c->body, "      if (ok) gmem[ga] = uchar(%s);\n", R(d));
@@ -1569,10 +1605,10 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             if (size < 4) {
                 static const char *const ext[] = {"(v >> sh) & 0xFFu", "uint(int(char((v >> sh) & 0xFFu)))", "(v >> sh) & 0xFFFFu",
                                                   "uint(int(short((v >> sh) & 0xFFFFu)))"};
-                if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      uint v = lmem[(la >> 2) & %du]; uint sh = (la & 3u) * 8u; r%d = %s;\n", LMEM_WORDS - 1, d, ext[size]); }
+                if (d != RZ) { mark_w(c, d); sp(&c->body, "      uint v = lmem[(la >> 2) & %du]; uint sh = (la & 3u) * 8u; r%d = %s;\n", LMEM_WORDS - 1, d, ext[size]); }
             } else {
                 for (int k = 0; k < nw; k++)
-                    if (d != RZ && d + k < RZ) { c->reg_used[d + k] = 1; sp(&c->body, "      r%d = lmem[((la >> 2) + %du) & %du];\n", d + k, k, LMEM_WORDS - 1); }
+                    if (d != RZ && d + k < RZ) { mark_w(c, d + k); sp(&c->body, "      r%d = lmem[((la >> 2) + %du) & %du];\n", d + k, k, LMEM_WORDS - 1); }
             }
         } else {
             if (size < 4) {
@@ -1624,14 +1660,14 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             c->uses_cc = true;
             sp(&c->body, "    { uint pr = (ccz ? 1u : 0u) | (ccs ? 2u : 0u) | ((cc & 1u) << 2);\n");
             sp(&c->body, "      uint m = (%s & 0xFu) << %du;\n", mask, shift);
-            if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = (%s & ~m) | ((pr << %du) & m);\n", d, R(a), shift); }
+            if (d != RZ) { mark_w(c, d); sp(&c->body, "      r%d = (%s & ~m) | ((pr << %du) & m);\n", d, R(a), shift); }
             sp(&c->body, "    }\n");
             goto p2r_done;
         }
         sp(&c->body, "    { uint pr = 0u;\n");
         for (int i = 0; i < 7; i++) { c->pred_used[i] = 1; sp(&c->body, "      pr |= (p%d ? 1u : 0u) << %du;\n", i, i); }
         sp(&c->body, "      uint m = (%s & 0x7Fu) << %du;\n", mask, shift);
-        if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = (%s & ~m) | ((pr << %du) & m);\n", d, R(a), shift); }
+        if (d != RZ) { mark_w(c, d); sp(&c->body, "      r%d = (%s & ~m) | ((pr << %du) & m);\n", d, R(a), shift); }
         sp(&c->body, "    }\n");
     p2r_done:;
     } else if (OPM(0xe250000000000000ull, 0xfff0000000000020ull)) {  // BRX reg + imm (relative)
@@ -1918,6 +1954,57 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     } else {
         sp(&s, "layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;\n");
     }
+    // PCSS (glsl_sample): shpcf_c(s, p, centre) moves the tap toward its centre by w, the distance to the blockers over
+    // PCSS's reach - sharp where an object meets the ground, the game's full spread where its shadow falls far. The
+    // blocker search uses the compare sampler only: at 5 depth offsets b, the occluded fraction of 8 taps around the
+    // centre is P(blocker closer than ref - b); its sum over the offsets gives the mean blocker distance (the sun's
+    // projection is orthographic: the penumbra grows with it alone). Done once per centre and depth (the game's taps
+    // share them). The search reaches as far as the game's own spread (the tap's distance from its centre). LEQUAL
+    // comparisons (Sword's and Let's Go's). PCSS_K: settings pcss / 100; LARECOMP_PCSS_DEBUG=1 returns w itself.
+    if (stage == STAGE_FRAGMENT && info->uses_pcss) {
+        static int dbgw = -1;
+        if (dbgw < 0) dbgw = getenv("LARECOMP_PCSS_DEBUG") ? 1 : 0;
+        sp(&s, "const float PCSS_K = %.3ff;\n"
+               "vec4 pc_key = vec4(-1e30f);\n"
+               "float pc_w = 1.0f;\n"
+               "const vec2 pc_o[8] = vec2[](vec2(-0.7f, -0.3f), vec2(0.3f, -0.7f), vec2(0.7f, 0.3f), vec2(-0.3f, 0.7f),\n"
+               "                            vec2(-0.25f, 0.1f), vec2(0.1f, 0.25f), vec2(0.25f, -0.1f), vec2(-0.1f, -0.25f));\n"
+               "const float pc_b[5] = float[](0.002f, 0.006f, 0.02f, 0.06f, 0.16f);\n", maxwell_pcss_k());
+        if (info->uses_pcss & 1)
+            sp(&s, "float shpcf_c(sampler2DShadow s, vec3 p, vec2 c) {\n"
+                   "  vec4 key = vec4(c, p.z, 0.0f);\n"
+                   "  if (key != pc_key) {\n"
+                   "    pc_key = key;\n"
+                   "    float R = max(length(p.xy - c), 1.5f / float(textureSize(s, 0).x)), f0 = 0.0f, d = 0.0f;\n"
+                   "    for (int i = 0; i < 5; i++) {\n"
+                   "      float f = 0.0f;\n"
+                   "      for (int j = 0; j < 8; j++) f += 1.0f - texture(s, vec3(c + pc_o[j] * R, p.z - pc_b[i]));\n"
+                   "      f *= 0.125f;\n"
+                   "      if (i == 0) { f0 = f; d = pc_b[0]; } else if (f0 > 0.0f) d += f / f0 * (pc_b[i] - pc_b[i - 1]);\n"
+                   "    }\n"
+                   "    pc_w = f0 > 0.0f ? clamp(d * PCSS_K * 12.0f, 0.12f, 1.0f) : 1.0f;\n"
+                   "  }\n"
+                   "%s"
+                   "  return texture(s, vec3(c + (p.xy - c) * pc_w, p.z));\n"
+                   "}\n", dbgw ? "  return pc_w;\n" : "");
+        if (info->uses_pcss & 2)
+            sp(&s, "float shpcfa_c(sampler2DArrayShadow s, vec4 p, vec2 c) {\n"
+                   "  vec4 key = vec4(c, p.z, p.w);\n"
+                   "  if (key != pc_key) {\n"
+                   "    pc_key = key;\n"
+                   "    float R = max(length(p.xy - c), 1.5f / float(textureSize(s, 0).x)), f0 = 0.0f, d = 0.0f;\n"
+                   "    for (int i = 0; i < 5; i++) {\n"
+                   "      float f = 0.0f;\n"
+                   "      for (int j = 0; j < 8; j++) f += 1.0f - texture(s, vec4(c + pc_o[j] * R, p.z, p.w - pc_b[i]));\n"
+                   "      f *= 0.125f;\n"
+                   "      if (i == 0) { f0 = f; d = pc_b[0]; } else if (f0 > 0.0f) d += f / f0 * (pc_b[i] - pc_b[i - 1]);\n"
+                   "    }\n"
+                   "    pc_w = f0 > 0.0f ? clamp(d * PCSS_K * 12.0f, 0.12f, 1.0f) : 1.0f;\n"
+                   "  }\n"
+                   "%s"
+                   "  return texture(s, vec4(c + (p.xy - c) * pc_w, p.z, p.w));\n"
+                   "}\n", dbgw ? "  return pc_w;\n" : "");
+    }
     sp(&s, "void main() {\n");
     if (stage == STAGE_VERTEX) {
         sp(&s, "  gl_Position = vec4(0, 0, 0, 1);\n");
@@ -1992,6 +2079,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     c->stage = stage;
     c->ipa_mode = -1;
     c->glsl = key && key->glsl;
+    memset(c->fma_c, 0xff, sizeof c->fma_c);  // (-1: no register is a tap's centre yet)
     const uint8_t *sph = blob + 0x30;
     const uint8_t *code = blob + 0x80;
     // compute programs have neither the 0x30-byte NVN header nor an SPH: code starts at the blob
@@ -2266,12 +2354,31 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
 // preparation, nvn/vulkan/prep.c) is redone for another build.
 // TRANSLATOR_ID (Makefile): a hash of the translator's sources, so a rebuild for another reason keeps the prepared
 // shaders. A build without it falls back to the compile time (every build prepares again).
+// The soft shadows' strength is part of it: the shaders it changes are prepared again when it changes (a draw would
+// otherwise miss every prepared part of them).
 const char *maxwell_build_stamp(void) {
+    static char stamp[96];
+    if (!stamp[0]) {
 #ifdef TRANSLATOR_ID
-    return TRANSLATOR_ID;
+        const char *id = TRANSLATOR_ID;
 #else
-    return __DATE__ " " __TIME__;
+        const char *id = __DATE__ " " __TIME__;
 #endif
+        snprintf(stamp, sizeof stamp, "%s-pcss%.0f", id, maxwell_pcss_k() * 100);
+    }
+    return stamp;
+}
+
+// Soft shadows' strength (glsl_sample shpcf_c): settings pcss in percent, 0 off; LARECOMP_PCSS=<percent> overrides.
+// Read once: it is in the translation, so a change takes effect at the next start.
+float maxwell_pcss_k(void) {
+    static float k = -1;
+    if (k < 0) {
+        const char *e = getenv("LARECOMP_PCSS");
+        int pct = e ? atoi(e) : g_settings.pcss;
+        k = pct > 0 ? (pct > 2000 ? 20.0f : pct / 100.0f) : 0.0f;
+    }
+    return k;
 }
 
 void maxwell_free(ShaderInfo *s) {

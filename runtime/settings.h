@@ -72,6 +72,7 @@ typedef struct {
     bool reverb;         // room reverb effect
     bool movie_audio;
     bool show_fps;
+    int pcss;            // soft sun shadows (PCSS) strength in percent, 0 off (runtime/nvn/maxwell/translate.c; next start)
     int shadow_res;      // the sun's shadow map: 1 the game's, 2 or 4 times as large (runtime/nvn/vulkan/textures.c)
     int aniso;           // anisotropic filtering: 0 the game's own, 2/4/8/16 (runtime/nvn/vulkan/textures.c; next start)
     bool dpad_move;      // the d-pad (and arrow keys) move the player like the stick

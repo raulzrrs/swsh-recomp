@@ -971,6 +971,11 @@ VkSampler vk_sampler(NvnSamplerDesc *d) {
     if (d->compare_mode) {
         si.compareEnable = VK_TRUE;
         si.compareOp = getenv("LARECOMP_NO_SHADOW") ? VK_COMPARE_OP_ALWAYS : compare_op(d->compare_func);
+        static uint32_t logged;  // (each comparison the game's depth-compare samplers use, once: the soft shadows assume it)
+        if (d->compare_func < 32 && !(logged >> d->compare_func & 1)) {
+            logged |= 1u << d->compare_func;
+            LOG("[vk] depth-compare sampler: compare function %u, filters %u / %u\n", d->compare_func, d->mag_filter, d->min_filter);
+        }
     }
     VkSamplerCustomBorderColorCreateInfoEXT cb = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
     if (border) {

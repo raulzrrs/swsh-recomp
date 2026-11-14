@@ -70,6 +70,7 @@ typedef struct {
     bool uses_gmem;         // global memory access: bind the guest heap at GMEM_BUFFER_INDEX
     bool gmem_stores;       // ... and it stores: the shader writes guest memory (through its storage buffers, or any pointer)
     bool uses_tint;         // fragment: reads the per-draw tint (buffer 19, float4[2]) applied to color target 0
+    uint8_t uses_pcss;      // fragment: shadow taps around a known centre (glsl_sample shpcf_c, 1 2D / 2 2D array: PCSS)
     bool uses_rscale;       // reads the resolution-scale table (fragment/compute buffer 18): float4 [0] = render
                             // target scale, [1 + i] = allocation scale of texture i
     uint32_t local_mem;     // bytes of local memory
@@ -93,5 +94,6 @@ extern const uint8_t *maxwell_dbg_vs;
 ShaderInfo *maxwell_translate(const uint8_t *code, size_t max_size, int stage, const ShaderKey *key);
 void maxwell_free(ShaderInfo *s);
 const char *maxwell_build_stamp(void);
+float maxwell_pcss_k(void);  // soft shadows (PCSS) strength, 0 off (settings pcss)
 // Disassemble for debugging (writes text to f).
 void maxwell_disassemble(const uint8_t *code, size_t max_size, int stage, void *file);
