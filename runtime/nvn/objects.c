@@ -132,6 +132,82 @@ NVN(nvnQueueFenceSync) {
     else { s->ticket = 0; s->seq = renderer_fence_seq(); }
 }
 void nvn_sync_set_seq(uint64_t guest, uint64_t seq) { NvnSync *s = sync_of(guest); s->signaled = 1; s->ticket = 0; s->seq = seq; }  // (a fence inside a list: runs on the render thread)
+
+// Fences recorded inside command lists (nvnCommandBufferFenceSync), by list (its handle: the first record's address).
+// Ported from Let's Go Recomp (0f200e0). With the render thread a list runs later than the game submits it, and the
+// game waits on these fences before it reuses what the list reads (its constants, its vertex data): the sync takes
+// the ticket of the job that runs the list when it is submitted (renderthread.c rt_submit), so nvnSyncWait waits for
+// that job and its GPU work, no more. Without the render thread the list runs inside the submit and its
+// CMD_FENCE_SYNC sets the GPU submission on the spot (exec.c). Before, CMD_FENCE_SYNC read the fence's condition
+// instead of its sync, so a fenced list's sync was never set and the game's wait on it returned at once: the game
+// could rewrite data a queued list had not been translated from yet.
+#define FL_N 512
+#define FL_SYNCS 16
+static struct { uint64_t list; int n; uint64_t sync[FL_SYNCS]; } fl[FL_N];
+static pthread_mutex_t fl_lock = PTHREAD_MUTEX_INITIALIZER;
+static int fl_slot(uint64_t list, bool add) {  // (holds fl_lock) -1: none
+    uint32_t h = (uint32_t)((list >> 3) * 0x9E3779B1u) & (FL_N - 1);
+    for (int k = 0; k < FL_N; k++, h = (h + 1) & (FL_N - 1)) {
+        if (fl[h].list == list) return (int)h;
+        if (!fl[h].list) {
+            if (!add) return -1;
+            fl[h].list = list, fl[h].n = 0;
+            return (int)h;
+        }
+    }
+    if (add) {  // (full: start over - the lists recorded long ago have run)
+        memset(fl, 0, sizeof fl);
+        return fl_slot(list, true);
+    }
+    return -1;
+}
+static void fl_add(int i, uint64_t sync) {
+    for (int k = 0; k < fl[i].n; k++) if (fl[i].sync[k] == sync) return;
+    if (fl[i].n < FL_SYNCS) fl[i].sync[fl[i].n++] = sync;
+    else {
+        static bool warned;
+        if (!warned) { warned = true; LOG("[nvn] a command list holds more than %d fences: the rest wait as before\n", FL_SYNCS); }
+    }
+}
+void nvn_list_begin(uint64_t list) {
+    if (!rt_active()) return;
+    pthread_mutex_lock(&fl_lock);
+    int i = fl_slot(list, false);
+    if (i >= 0) fl[i].n = 0;  // (the memory holds another list now)
+    pthread_mutex_unlock(&fl_lock);
+}
+void nvn_list_fence(uint64_t list, uint64_t sync) {
+    const char *e = ENV("LARECOMP_LIST_FENCES");  // (=0: such syncs left unset, the old behaviour, for A/B runs)
+    if (!rt_active() || !list || !sync || (e && !atoi(e))) return;
+    pthread_mutex_lock(&fl_lock);
+    fl_add(fl_slot(list, true), sync);
+    pthread_mutex_unlock(&fl_lock);
+}
+void nvn_list_call(uint64_t list, const uint64_t *called, int n) {
+    if (!rt_active() || !list || !called) return;
+    pthread_mutex_lock(&fl_lock);
+    for (int k = 0; k < n; k++) {
+        int j = fl_slot(called[k], false);
+        if (j < 0 || !fl[j].n) continue;
+        uint64_t s[FL_SYNCS];
+        int m = fl[j].n;
+        memcpy(s, fl[j].sync, sizeof s);
+        int i = fl_slot(list, true);
+        for (int q = 0; q < m; q++) fl_add(i, s[q]);
+    }
+    pthread_mutex_unlock(&fl_lock);
+}
+void nvn_list_submitted(uint64_t list, uint64_t ticket) {
+    if (!ticket) return;
+    pthread_mutex_lock(&fl_lock);
+    int i = fl_slot(list, false);
+    if (i >= 0)
+        for (int k = 0; k < fl[i].n; k++) {
+            NvnSync *s = sync_of(fl[i].sync[k]);
+            s->signaled = 1, s->seq = 0, s->ticket = ticket;
+        }
+    pthread_mutex_unlock(&fl_lock);
+}
 NVN(nvnQueueWaitSync) { RET(1); }
 
 // ================================================================== sync / event
@@ -143,7 +219,7 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     static int flush = -1;
     static uint64_t n;
     if (flush < 0) flush = getenv("LARECOMP_SYNC_FLUSH") ? 1 : 0;
-    if (getenv("LARECOMP_LOG_SYNC") && n++ % 60 == 0) LOG("[nvn] SyncWait #%llu (lr %llx)\n", (unsigned long long)n, c->x[30]);
+    if (ENV("LARECOMP_LOG_SYNC") && n++ % 60 == 0) LOG("[nvn] SyncWait #%llu (lr %llx)\n", (unsigned long long)n, c->x[30]);
     static int whole = -1;  // LARECOMP_SYNC_ALL=1: old behaviour, wait for all submitted work
     if (whole < 0) whole = getenv("LARECOMP_SYNC_ALL") ? 1 : 0;
     if (flush) { rt_drain(); renderer_flush(); }

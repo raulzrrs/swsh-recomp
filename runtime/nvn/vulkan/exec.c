@@ -5543,7 +5543,9 @@ static void exec_list(uint64_t handle, int depth) {
             if (fence_flush < 0) fence_flush = getenv("LARECOMP_FENCE_FLUSH") ? 1 : 0;
             if (fence_flush) renderer_flush();
             extern void nvn_sync_set_seq(uint64_t guest, uint64_t seq);
-            if (r->x[1]) nvn_sync_set_seq(r->x[1], renderer_fence_seq());
+            // (x[0] the sync - x[1] is the condition. With the render thread the sync took this list's ticket when the
+            // game submitted it: objects.c nvn_list_submitted)
+            if (r->x[0] && !rt_on_render_thread()) nvn_sync_set_seq(r->x[0], renderer_fence_seq());
             break;
         }
         case CMD_REPORT_COUNTER: {

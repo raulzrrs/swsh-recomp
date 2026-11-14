@@ -159,6 +159,12 @@ void rt_present(NvnTexture *tex);
 void rt_call(void (*fn)(void *), void *arg);
 void rt_drain(void);
 uint64_t rt_fence_ticket(void);
+// fences recorded in command lists (objects.c): with the render thread a sync fenced in a list takes the ticket of the
+// job that runs the list when it is submitted, and nvnSyncWait waits for that job (and its GPU work) only
+void nvn_list_begin(uint64_t list);
+void nvn_list_fence(uint64_t list, uint64_t sync);
+void nvn_list_call(uint64_t list, const uint64_t *called, int n);
+void nvn_list_submitted(uint64_t list, uint64_t ticket);
 void rt_wait_ticket(uint64_t ticket);
 void rt_reset(void);
 uint64_t renderer_game_frame(void);  // presents the game has made (the backend's own count: renderer_present_count)
