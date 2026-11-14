@@ -61,7 +61,7 @@ int bind_pad_from_name(const char *name);
 // Button prompts (runtime/nvn/texpatch.c): the controller button now driving Switch input `slot` (BIND_A..)
 int bind_prompt_host(int slot);
 // Controller layout: which buttons are A / B / X / Y by default (launcher, Game page; larecomp.ini pad_layout)
-enum { BIND_LAYOUT_NINTENDO = 0, BIND_LAYOUT_XBOX = 1 };
+enum { BIND_LAYOUT_NINTENDO = 0, BIND_LAYOUT_XBOX = 1, BIND_LAYOUT_WESTERN = 2 };
 int bind_layout(void);
 void bind_set_layout(int layout);  // A / B and X / Y still at the old layout's defaults move to the new one's
 

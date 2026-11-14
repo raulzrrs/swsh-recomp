@@ -27,22 +27,29 @@ _Static_assert(PADB_LTRIGGER == SDL_GAMEPAD_BUTTON_COUNT, "trigger pseudo-button
     SDL_SCANCODE_W, SDL_SCANCODE_S, SDL_SCANCODE_A, SDL_SCANCODE_D, SDL_SCANCODE_KP_8, SDL_SCANCODE_KP_5, \
     SDL_SCANCODE_KP_4, SDL_SCANCODE_KP_6}
 static const int16_t k_def_pad[BIND_PAD_COUNT] = DEF_PAD, k_def_key[BIND_KEY_COUNT] = DEF_KEY;
-// Controller layout (launcher, Game page; larecomp.ini pad_layout): Nintendo (the defaults above, by position) or Xbox
-// - A on the bottom button, B on the right, X on the left, Y on the top, as the letters printed on an Xbox pad
+// Controller layout (launcher, Game page; larecomp.ini pad_layout): Nintendo (the defaults above, by position), Xbox
+// - A on the bottom button, B on the right, X on the left, Y on the top, as the letters printed on an Xbox pad - or
+// Western: A on the bottom button and B on the right (confirm and back where PlayStation and Xbox pads have them), X
+// and Y where Nintendo has them (issue #15: a PlayStation button-prompt mod, whose X / Y icons stay in place).
 static int g_layout;  // BIND_LAYOUT_*
 static int16_t def_pad(int layout, int slot) {
     static const int16_t xbox[4] = {SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH};
-    return layout == BIND_LAYOUT_XBOX && slot < 4 ? xbox[slot] : k_def_pad[slot];
+    static const int16_t western[4] = {SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_NORTH, SDL_GAMEPAD_BUTTON_WEST};
+    if (slot < 4 && layout == BIND_LAYOUT_XBOX) return xbox[slot];
+    if (slot < 4 && layout == BIND_LAYOUT_WESTERN) return western[slot];
+    return k_def_pad[slot];
 }
 int bind_layout(void) { return g_layout; }
 // A / B and X / Y follow the layout where they are still at the old one's defaults (a remap of the Controls page stays)
 void bind_set_layout(int layout) {
-    layout = layout == BIND_LAYOUT_XBOX ? BIND_LAYOUT_XBOX : BIND_LAYOUT_NINTENDO;
+    if (layout != BIND_LAYOUT_XBOX && layout != BIND_LAYOUT_WESTERN) layout = BIND_LAYOUT_NINTENDO;
     if (layout == g_layout) return;
     for (int i = 0; i < 4; i++)
         if (g_bind_pad[i] == def_pad(g_layout, i)) g_bind_pad[i] = def_pad(layout, i);
     g_layout = layout;
-    LOG("[input] controller layout: %s\n", layout == BIND_LAYOUT_XBOX ? "Xbox (A bottom, B right)" : "Nintendo (A right, B bottom)");
+    LOG("[input] controller layout: %s\n", layout == BIND_LAYOUT_XBOX ? "Xbox (A bottom, B right, X left, Y top)"
+                                           : layout == BIND_LAYOUT_WESTERN ? "Western (A bottom, B right, X top, Y left)"
+                                                                           : "Nintendo (A right, B bottom)");
 }
 int16_t g_bind_pad[BIND_PAD_COUNT] = DEF_PAD, g_bind_key[BIND_KEY_COUNT] = DEF_KEY;
 const int16_t g_bind_key2[BIND_PAD_COUNT] = {SDL_SCANCODE_RETURN, SDL_SCANCODE_BACKSPACE};
@@ -225,7 +232,10 @@ bool bind_capture_event(const SDL_Event *e) {
 
 // ------------------------------------------------------------------ larecomp.ini
 bool bind_settings_load(const char *key, const char *val) {
-    if (!strcmp(key, "pad_layout")) { bind_set_layout(!strcmp(val, "xbox") ? BIND_LAYOUT_XBOX : BIND_LAYOUT_NINTENDO); return true; }
+    if (!strcmp(key, "pad_layout")) {
+        bind_set_layout(!strcmp(val, "xbox") ? BIND_LAYOUT_XBOX : !strcmp(val, "western") ? BIND_LAYOUT_WESTERN : BIND_LAYOUT_NINTENDO);
+        return true;
+    }
     bool pad = !strncmp(key, "bind_pad_", 9), kb = !strncmp(key, "bind_key_", 9);
     if (!pad && !kb) return false;
     for (int i = 0; i < (pad ? BIND_PAD_COUNT : BIND_KEY_COUNT); i++) {
@@ -242,7 +252,7 @@ bool bind_settings_load(const char *key, const char *val) {
 }
 
 void bind_settings_save(FILE *f) {
-    fprintf(f, "pad_layout = %s\n", g_layout == BIND_LAYOUT_XBOX ? "xbox" : "nintendo");  // (before the bind_pad_ lines)
+    fprintf(f, "pad_layout = %s\n", g_layout == BIND_LAYOUT_XBOX ? "xbox" : g_layout == BIND_LAYOUT_WESTERN ? "western" : "nintendo");  // (before the bind_pad_ lines)
     for (int i = 0; i < BIND_PAD_COUNT; i++)
         if (g_bind_pad[i] != def_pad(g_layout, i) && g_bind_pad[i] >= 0 && g_bind_pad[i] < PADB_HOST_COUNT)
             fprintf(f, "bind_pad_%s = %s\n", k_ini[i], k_pad_ini[g_bind_pad[i]]);

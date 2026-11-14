@@ -587,12 +587,12 @@ extern "C" void launcher_lg_run(const char *root) {
                 // (Let's Go's wild battles and controller-screen skip hook its code: not here)
                 const char *ol[] = {T("Controller layout", "Layout do controle")};
                 float ox = ui_label_x(ol, 1);
-                const char *lay[] = {"Nintendo", "Xbox"};
+                const char *lay[] = {"Nintendo", "Xbox", T("Western (A / B only)", "Ocidental (só A / B)")};
                 int lv = bind_layout();
                 ui_row(ol[0], ox);
-                if (ui_combo("##padlayout", &lv, lay, 2)) bind_set_layout(lv);
-                ui_tip(T("Which controller buttons are A / B and X / Y. Nintendo: A right, B bottom. Xbox: A bottom, B right, as the letters on an Xbox controller. The button prompts follow.",
-                         "Quais botões do controle são A / B e X / Y. Nintendo: A à direita, B embaixo. Xbox: A embaixo, B à direita, como as letras de um controle de Xbox. Os ícones dos botões acompanham."));
+                if (ui_combo("##padlayout", &lv, lay, 3)) bind_set_layout(lv);
+                ui_tip(T("Which controller buttons are A / B and X / Y. Nintendo: A right, B bottom. Xbox: A bottom, B right, as the letters on an Xbox controller. Western: A bottom and B right, X and Y where Nintendo has them. The button prompts follow.",
+                         "Quais botões do controle são A / B e X / Y. Nintendo: A à direita, B embaixo. Xbox: A embaixo, B à direita, como as letras de um controle de Xbox. Ocidental: A embaixo e B à direita, X e Y onde a Nintendo os põe. Os ícones dos botões acompanham."));
             } else if (tab == TAB_GRAPHICS) {
                 const char *extra[] = {T("Resolution", "Resolução"), T("Fullscreen", "Tela cheia")};
                 float x = ui_graphics_x(extra, 2);
