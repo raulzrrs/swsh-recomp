@@ -173,7 +173,10 @@ int ipc_handle_request(Cpu *c, uint32_t handle) {
             target = req.domain_obj < 256 ? sess->domain->objs[req.domain_obj] : NULL;
             if (!target) { LOG("[ipc] domain object %u missing\n", req.domain_obj); return 0xE401; }
         }
+        uint64_t t0 = plat_now_ns();
         target->handler(target, &req, &resp);
+        uint64_t dt = plat_now_ns() - t0;  // ([ipc] slow: a service that keeps the asking game thread waiting)
+        if (dt > 20000000) LOG("[ipc] slow: %s cmd %u took %.1f ms\n", target->name, req.cmd, dt / 1e6);
     } else if (req.type == 5 || req.type == 7) {  // control
         req.cmd = *(uint32_t *)(payload + 8);
         LOG("[ipc] control %u on %s (handle %x)\n", req.cmd, sess->svc->name, handle);

@@ -368,8 +368,21 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
         IpcBuf *b = out_buf(req, 0);
         if (!b) { resp->result = MAKE_RESULT(2, 6001); break; }
         if (size > b->size) size = b->size;
+        uint64_t t0 = plat_now_ns();
         ssize_t n = romfs_read(st->fd, (uint8_t *)(uintptr_t)b->addr, size, off);
+        uint64_t dt = plat_now_ns() - t0;
         touch_pages(b->addr, n);
+        // Slow reads ([fs] slow romfs read): the game streams the world from the image as the player moves, and a
+        // read that waits on the disk holds the thread that asked (a slow SATA SSD: 100+ ms hitches walking in the
+        // Wild Area). LARECOMP_FS_SLOW_MS=<ms> (default 20; 0 logs none).
+        static int64_t slow_ns = -1;
+        if (slow_ns < 0) slow_ns = (ENV("LARECOMP_FS_SLOW_MS") ? atoll(ENV("LARECOMP_FS_SLOW_MS")) : 20) * 1000000ll;
+        static uint64_t read_ns_total;
+        read_ns_total += dt;
+        if (slow_ns > 0 && (int64_t)dt >= slow_ns) {
+            const char *p = romfs_file_at(off);
+            LOG("[fs] slow romfs read: %llu KB in %.1f ms (%s)\n", (unsigned long long)(size >> 10), dt / 1e6, p ? p : "?");
+        }
         if (n < 0) LOG("[fs] storage read failed at %llx: %s\n", off, strerror(errno));
         {
             const char *path = romfs_file_at(off);
@@ -382,7 +395,8 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
         static uint64_t reads, bytes;
         reads++;
         bytes += size;
-        if ((reads & (reads - 1)) == 0) LOG("[fs] romfs reads: %llu (%llu KB)\n", reads, bytes >> 10);
+        if ((reads & (reads - 1)) == 0)
+            LOG("[fs] romfs reads: %llu (%llu KB, %.0f ms reading)\n", reads, bytes >> 10, read_ns_total / 1e6);
         break;
     }
     case 4: OUT(uint64_t, 0) = ov_n ? ov_end : st->size; resp_size(resp, 8); break;  // GetSize
