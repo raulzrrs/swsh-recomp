@@ -312,6 +312,72 @@ static void finished(uint64_t id) {
     pthread_mutex_unlock(&g_done_lock);
 }
 
+// ------------------------------------------------------------------ parts that stopped the driver (cache/shader_prep_inflight.bin)
+// The driver's shader compiler can crash the process on one stage (NVIDIA, nvgpucomp64.dll: issues #1, #6), and the
+// preparation resumed where it stopped, so it built that stage again and crashed on every start, at the same
+// percentage. Each thread writes the id of the part it hands to the driver into its slot of this file and clears it
+// when the driver returns; a slot still set at the next start is a part the driver didn't come back from: it is
+// marked done (skipped) and logged. A draw that really uses that stage still builds it then, alone.
+#define INFLIGHT_SLOTS 16
+static uint64_t g_inflight[INFLIGHT_SLOTS];
+static pthread_mutex_t g_inflight_lock = PTHREAD_MUTEX_INITIALIZER;
+static FILE *g_inflight_f;
+
+static void inflight_path(char *out, size_t n) { snprintf(out, n, "%s/shader_prep_inflight.bin", rt_cache_dir()); }
+
+static void inflight_write(void) {  // (under g_inflight_lock: the whole table, flushed to the OS, which keeps it if we crash)
+    if (!g_inflight_f) return;
+    fseek(g_inflight_f, 0, SEEK_SET);
+    fwrite(g_inflight, sizeof g_inflight, 1, g_inflight_f);
+    fflush(g_inflight_f);
+}
+
+// At the start, after done_load: the parts of the last run that never came back are skipped from now on.
+static void inflight_recover(void) {
+    char path[600];
+    inflight_path(path, sizeof path);
+    FILE *f = fopen(path, "rb");
+    uint64_t ids[INFLIGHT_SLOTS] = {0};
+    if (f) {
+        if (fread(ids, sizeof ids, 1, f) != 1) memset(ids, 0, sizeof ids);
+        fclose(f);
+    }
+    int n = 0;
+    for (int i = 0; i < INFLIGHT_SLOTS; i++)
+        if (ids[i]) {
+            pthread_mutex_lock(&g_done_lock);
+            bool had = done_has(ids[i], true);
+            pthread_mutex_unlock(&g_done_lock);
+            if (!had) { finished(ids[i]); n++; }
+            LOG("[prep] part %016llx: the last run stopped while the driver compiled it; skipped (a draw that needs it builds it)\n",
+                (unsigned long long)ids[i]);
+        }
+    if (n) done_save();
+    g_inflight_f = fopen(path, "wb");
+    pthread_mutex_lock(&g_inflight_lock);
+    memset(g_inflight, 0, sizeof g_inflight);
+    inflight_write();
+    pthread_mutex_unlock(&g_inflight_lock);
+}
+
+static int inflight_begin(uint64_t id) {  // -> slot, or -1 (all taken: the part is built unrecorded)
+    pthread_mutex_lock(&g_inflight_lock);
+    int s = -1;
+    for (int i = 0; i < INFLIGHT_SLOTS && s < 0; i++)
+        if (!g_inflight[i]) s = i;
+    if (s >= 0) { g_inflight[s] = id; inflight_write(); }
+    pthread_mutex_unlock(&g_inflight_lock);
+    return s;
+}
+
+static void inflight_end(int s) {
+    if (s < 0) return;
+    pthread_mutex_lock(&g_inflight_lock);
+    g_inflight[s] = 0;
+    inflight_write();
+    pthread_mutex_unlock(&g_inflight_lock);
+}
+
 // ------------------------------------------------------------------ building
 static _Atomic int g_next_file;
 static _Atomic uint64_t stat_parts, stat_skipped, stat_failed, stat_part_ns;
@@ -339,6 +405,7 @@ static ShaderInfo *build_stage(const Stage *s, const ShaderKey *key, bool want_i
     }
     if (!todo) { atomic_fetch_add(&stat_skipped, 1); return si; }
     uint64_t t0 = SDL_GetTicksNS();
+    int slot = inflight_begin(id);  // (until the driver has come back: a crash in it skips this part next start)
     size_t nw = 0;
     uint32_t *spv = vk_glsl_to_spirv(si->msl, s->stage, s->stage == STAGE_VERTEX ? "vs" : "fs", &nw);
     bool ok = false;
@@ -357,6 +424,7 @@ static ShaderInfo *build_stage(const Stage *s, const ShaderKey *key, bool want_i
         vkDestroyDescriptorSetLayout(g_vk.dev, sl, NULL);
         free(spv);
     }
+    inflight_end(slot);
     atomic_fetch_add(&stat_part_ns, SDL_GetTicksNS() - t0);
     atomic_fetch_add(ok ? &stat_parts : &stat_failed, 1);
     finished(id);
@@ -487,6 +555,7 @@ static void *prep_main(void *a) {
     while (!g_vk.dev || !g_vk.pcache) SDL_DelayNS(50 * 1000000ull);
     if (!g_vk.gpl) { LOG("[prep] off: needs the pipeline parts (LARECOMP_GPL=0, or not supported)\n"); return NULL; }
     done_load();
+    inflight_recover();
     if (complete_check()) {
         LOG("[prep] already done for this build, GPU and driver\n");
         return NULL;
