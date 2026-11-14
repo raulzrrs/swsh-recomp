@@ -2264,7 +2264,15 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
 
 // When this translator was built: its output may change with any edit, so work keyed by its output (the shader
 // preparation, nvn/vulkan/prep.c) is redone for another build.
-const char *maxwell_build_stamp(void) { return __DATE__ " " __TIME__; }
+// TRANSLATOR_ID (Makefile): a hash of the translator's sources, so a rebuild for another reason keeps the prepared
+// shaders. A build without it falls back to the compile time (every build prepares again).
+const char *maxwell_build_stamp(void) {
+#ifdef TRANSLATOR_ID
+    return TRANSLATOR_ID;
+#else
+    return __DATE__ " " __TIME__;
+#endif
+}
 
 void maxwell_free(ShaderInfo *s) {
     if (!s) return;
