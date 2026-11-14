@@ -7,8 +7,12 @@
 #include "cpu.h"
 #include "platform.h"
 
-#define LOG(...) fprintf(stderr, __VA_ARGS__)
-#define FATAL(...) (fprintf(stderr, "FATAL: " __VA_ARGS__), rt_fatal_trace())
+// LOG queues the line for the log's own writer thread (runtime/log.c): a game thread never waits on the disk.
+// FATAL empties the queue first, then writes on its own thread, as the crash report does.
+void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void rt_log_flush(void);
+#define LOG(...) rt_log(__VA_ARGS__)
+#define FATAL(...) (rt_log_flush(), fprintf(stderr, "FATAL: " __VA_ARGS__), rt_fatal_trace())
 
 // ---- address space layout (guest addresses == host addresses)
 // macOS reserves 0x2_0000_0000-0x70_0000_0000, and guest addresses must fit in 39 bits, so the

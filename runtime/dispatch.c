@@ -245,6 +245,7 @@ static const char *host_sym(uint64_t pc, uint64_t *offset) {
 }
 
 void rt_fatal_trace(void) {
+    rt_log_flush();  // (the queued lines first: they say what led here)
     hhist_dump();
     fprintf(stderr, "host backtrace (guest functions are f_<addr>):\n");
     plat_print_backtrace();
@@ -312,6 +313,7 @@ bool rt_fault_watch(uint64_t fa, uint64_t pc) {
 }
 
 void rt_fault_report(const char *what, uint64_t fa, uint64_t pc, uint64_t lr) {
+    rt_log_flush();  // (the queued lines first: they say what led here)
     uint64_t po = 0, lo = 0;
     const char *ps = host_sym(pc, &po), *ls = host_sym(lr, &lo);
     fprintf(stderr, "\n*** %s accessing %#llx\n    host pc %llx (%s+%llx)\n    host lr %llx (%s)\n", what,
