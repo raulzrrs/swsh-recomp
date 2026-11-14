@@ -30,6 +30,9 @@ enum {
 
 // The game files in <data root>/extracted: ready to play (exefs, romfs.bin and game code built for this version).
 bool setup_ready(void);
+// The game files set up, but no game code built for this version (a new version unzipped over the folder): the
+// start screen rebuilds it by itself (setup_start(NULL)), instead of asking for the game folder again.
+bool setup_needs_build(void);
 // The game in that exefs/ folder: "Eevee", "Pikachu", "Sword", "Shield" or NULL.
 const char *game_name(const char *exefs);
 // Its full name for the launcher ("Pokémon Sword"...) or NULL.

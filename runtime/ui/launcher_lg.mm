@@ -461,6 +461,14 @@ extern "C" void launcher_lg_run(const char *root) {
         }
         char path[1024];
         if (take(g_pick_game, path, sizeof path)) setup_start(path);
+        {   // a new version over set-up game files: its game code is rebuilt by itself (once: a failure shows and waits).
+            // From Let's Go Recomp (db1b439): the library id follows the generator, so an update asked for the folder again.
+            static bool rebuilt;
+            if (!rebuilt && !setup_running() && setup_needs_build()) {
+                rebuilt = true;
+                setup_start(NULL);
+            }
+        }
         if (take(g_pick_mod, path, sizeof path)) mod_install_start(path);
         static int last_install;
         int inst = mod_install_state();

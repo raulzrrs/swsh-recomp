@@ -155,6 +155,10 @@ bool setup_ready(void) {
     return game_ok(ROOT "/exefs") && image_ok() && gamelib_present(ROOT);
 }
 
+bool setup_needs_build(void) {
+    return game_ok(ROOT "/exefs") && image_ok() && !gamelib_present(ROOT);
+}
+
 typedef struct { char exefs[1024], romfs[1024], romfs_bin[1024]; bool package; } Found;
 
 static void find_game(const char *dir, int depth, Found *f) {
@@ -224,6 +228,7 @@ static void *setup_thread(void *arg) {
     (void)arg;
     g_progress = 0;
     if (!g_folder[0]) {  // only the game code (files set up already, e.g. a new version of the app)
+        LOG("[setup] the game files are set up, the game code is from another version: rebuilding it\n");
         if (build_code()) g_state = setup_ready() ? SETUP_DONE : SETUP_FAIL_BUILD;
         g_running = false;
         return NULL;
