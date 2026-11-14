@@ -1,0 +1,2 @@
+{"description": "The player's own save (Shield 1.3.2 save of 10/10, Expansion Pass) loaded in Sword, standing where it was saved: the session of 14/11 ran at ~46 fps with a ~155 ms stall in every 2 s window",
+ "save": "build/scenario-saves/user-shield", "input": "600:A:8,800:A:8", "exit_at": 1300, "measure": [700, 1250], "shots": [1250]}

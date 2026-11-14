@@ -105,6 +105,9 @@ def run_once(name, sc, args, run_dir):
     with open(ini, "w") as f:
         f.write(f"fullscreen = 0\nfps = {fps}\nrender_height = {height}\nsmaa = 1\nupscaler = fsr1\nshow_fps = 0\n"
                 f"render_thread = 1\nvertex_read = auto\n")
+        for kv in args.ini or []:  # (later lines win: --ini fullscreen=1 runs the profile in full screen)
+            ik, _, iv = kv.partition("=")
+            f.write(f"{ik.strip()} = {iv.strip()}\n")
     if args.cache == "cold":
         cache = os.path.join(run_dir, "coldcache")
         os.makedirs(cache)
@@ -244,6 +247,7 @@ def main():
     ap.add_argument("--label", default="")
     ap.add_argument("--exe", default=os.path.join("build", "v132", "lasrecomp.exe"))
     ap.add_argument("--env", action="append", help="VAR=value for this run (repeatable)")
+    ap.add_argument("--ini", action="append", help="key=value added to the run's larecomp.ini, over the profile's (repeatable)")
     args = ap.parse_args()
     with open(os.path.join(ROOT, "tests", "scenarios", args.scenario + ".json")) as f:
         sc = json.load(f)
