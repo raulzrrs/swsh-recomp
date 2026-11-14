@@ -174,16 +174,20 @@ static void game_files_section(SDL_Window *win) {
     if (st >= SETUP_FAIL_NOT_FOUND) {
         static const char *const en[] = {"No game files found in that folder.", "Those are packed game files (.xci / .nsp).",
                                          "That's not Pokémon Sword or Shield.", "The files couldn't be copied.",
-                                         "The game code didn't build.", "The game code builder is missing from this copy."};
+                                         "The game code didn't build.", "The game code builder is missing from this copy.",
+                                         "The game data image is incomplete or unreadable."};
         static const char *const pt[] = {"Nenhum arquivo do jogo nessa pasta.", "Esses são arquivos do jogo empacotados (.xci / .nsp).",
                                          "Isso não é o Pokémon Sword nem o Shield.", "Os arquivos não puderam ser copiados.",
-                                         "O código do jogo não compilou.", "O compilador do código do jogo não está nesta cópia."};
+                                         "O código do jogo não compilou.", "O compilador do código do jogo não está nesta cópia.",
+                                         "A imagem de dados do jogo está incompleta ou ilegível."};
         static const char *const en_h[] = {"Choose the folder that holds exefs and romfs.", "Extract them first (exefs and romfs).",
                                            "Pick the folder of your own extracted Sword or Shield (with the 1.3.2 update).", "Check there are about 15 GB free and try again.",
-                                           "Check there are about 2 GB free and try again; details in lasrecomp.log.", "Download the release again."};
+                                           "Check there are about 2 GB free and try again; details in lasrecomp.log.", "Download the release again.",
+                                           "Pick the folder of the whole game (the base game with the 1.3.2 update), not a mod's or the update's alone."};
         static const char *const pt_h[] = {"Escolha a pasta que tem exefs e romfs.", "Extraia antes (exefs e romfs).",
                                            "Escolha a pasta do seu Sword ou Shield extraído (com a atualização 1.3.2).", "Confira se há uns 15 GB livres e tente de novo.",
-                                           "Confira se há uns 2 GB livres e tente de novo; detalhes no lasrecomp.log.", "Baixe a release de novo."};
+                                           "Confira se há uns 2 GB livres e tente de novo; detalhes no lasrecomp.log.", "Baixe a release de novo.",
+                                           "Escolha a pasta do jogo inteiro (a base com a atualização 1.3.2), não a de um mod nem só a da atualização."};
         int k = st - SETUP_FAIL_NOT_FOUND;
         ImGui::TextColored(k_red, "%s", T(en[k], pt[k]));
         ImGui::TextDisabled("%s", T(en_h[k], pt_h[k]));

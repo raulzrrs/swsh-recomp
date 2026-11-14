@@ -20,6 +20,8 @@
 #include <windows.h>
 #endif
 
+#define ROMFS_GAME_FILES 41702  // (Sword 1.3.2's image, the update merged: counted. The log's "romfs index" adds mods' new files)
+#define ROMFS_MIN_FILES 30000   // (well below a whole game, far above a mod's romfs: 551 files in issue #10)
 #define EMPTY 0xFFFFFFFFu
 #define DATA_START 0x200u
 
@@ -304,6 +306,41 @@ static bool copy_dir(Dir *d, const char *dst, uint64_t *done, uint64_t total, vo
         free(p);
         if (!ok) return false;
     }
+    return true;
+}
+
+// Ported from Let's Go Recomp (3df94a9, 550ce7c). A romfs.bin the game can't read stopped it at its first read with
+// 2002-6063; one with files missing (a mod's or an update's romfs picked as the game's) crashed at the first file whose
+// open failed, in nn::fs::ReadFile (issue #10: 551 files, the mod's own).
+bool romfs_image_ok(const char *path, char *why, size_t why_size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { snprintf(why, why_size, "can't open it"); return false; }
+    uint64_t h[10] = {0};
+    size_t n = fread(h, 1, sizeof h, f);
+    fseeko(f, 0, SEEK_END);
+    uint64_t size = (uint64_t)ftello(f);
+    fclose(f);
+    if (n == sizeof h && !memcmp(h, "IVFC", 4)) { snprintf(why, why_size, "an IVFC image, not a plain RomFS"); return false; }
+    if (n != sizeof h || h[0] != 0x50) { snprintf(why, why_size, "no RomFS header (%llu bytes)", (unsigned long long)size); return false; }
+    for (int i = 1; i < 9; i += 2)  // (dir hash, dir meta, file hash, file meta: offset and size, inside the file)
+        if (!h[i + 1] || h[i + 1] > (64ull << 20) || h[i] > size || h[i + 1] > size - h[i]) {
+            snprintf(why, why_size, "its tables point past its end (%llu bytes: cut short?)", (unsigned long long)size);
+            return false;
+        }
+    if (h[9] > size) { snprintf(why, why_size, "its data starts past its end (%llu bytes)", (unsigned long long)size); return false; }
+    // The file table's entries: parent, sibling (u32), offset, size (u64), hash, name length (u32), name.
+    uint8_t *meta = malloc(h[8]);
+    f = meta ? fopen(path, "rb") : NULL;
+    bool got = f && fseeko(f, (off_t)h[7], SEEK_SET) == 0 && fread(meta, 1, h[8], f) == h[8];
+    if (f) fclose(f);
+    int nfiles = 0;
+    for (uint64_t o = 0; got && o + 0x20 <= h[8]; nfiles++) {
+        uint32_t len;
+        memcpy(&len, meta + o + 0x1C, 4);
+        o += 0x20 + ((len + 3ull) & ~3ull);
+    }
+    free(meta);
+    if (got && nfiles < ROMFS_MIN_FILES) { snprintf(why, why_size, "only %d files: the game has %d", nfiles, ROMFS_GAME_FILES); return false; }
     return true;
 }
 

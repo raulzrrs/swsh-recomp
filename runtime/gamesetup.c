@@ -37,7 +37,12 @@ static _Atomic float g_progress;
 static _Atomic bool g_running;
 static char g_folder[1024];
 
-int setup_state(void) { return g_state; }
+static bool image_ok(void);
+static bool is_file(const char *p);
+int setup_state(void) {  // (idle with a romfs.bin set up before that can't be read: say so, the setup is to be done again)
+    if (g_state == SETUP_IDLE && !g_running && is_file(ROOT "/romfs.bin") && !image_ok()) return SETUP_FAIL_IMAGE;
+    return g_state;
+}
 float setup_progress(void) { return g_progress; }
 bool setup_running(void) { return g_running; }
 
@@ -130,8 +135,24 @@ const char *game_pair_title_id(const char *exefs) {
          : id == TITLE_SWORD ? "01008DB008C2C000" : id == TITLE_SHIELD ? "0100ABF008968000" : NULL;
 }
 
+// (a romfs.bin that isn't a whole, readable RomFS: set up again; romfs_build.c romfs_image_ok). It reads the file
+// table, so it runs once per image size and time, not on every frame of the start screen.
+static bool image_ok(void) {
+    static long long checked_size = -1, checked_time = -1;
+    static bool ok;
+    struct stat st;
+    if (stat(ROOT "/romfs.bin", &st) != 0) return false;
+    if ((long long)st.st_size != checked_size || (long long)st.st_mtime != checked_time) {
+        char why[128];
+        ok = romfs_image_ok(ROOT "/romfs.bin", why, sizeof why);
+        if (!ok) LOG("[setup] the game data image: %s\n", why);
+        checked_size = (long long)st.st_size, checked_time = (long long)st.st_mtime;
+    }
+    return ok;
+}
+
 bool setup_ready(void) {
-    return game_ok(ROOT "/exefs") && is_file(ROOT "/romfs.bin") && gamelib_present(ROOT);
+    return game_ok(ROOT "/exefs") && image_ok() && gamelib_present(ROOT);
 }
 
 typedef struct { char exefs[1024], romfs[1024], romfs_bin[1024]; bool package; } Found;
@@ -249,8 +270,12 @@ static void *setup_thread(void *arg) {
         ok = romfs_build(f.romfs, ROOT "/romfs.bin", copy_progress, why, sizeof why);
         if (!ok) LOG("[setup] romfs image: %s\n", why);
     }
+    char why[128];
     if (!ok) g_state = SETUP_FAIL_COPY;
-    else if (build_code()) g_state = setup_ready() ? SETUP_DONE : SETUP_FAIL_BUILD;
+    else if (!romfs_image_ok(ROOT "/romfs.bin", why, sizeof why)) {
+        LOG("[setup] the game data image %s: %s\n", f.romfs_bin[0] ? f.romfs_bin : "(built)", why);
+        g_state = SETUP_FAIL_IMAGE;
+    } else if (build_code()) g_state = setup_ready() ? SETUP_DONE : SETUP_FAIL_BUILD;
     LOG("[setup] %s\n", g_state == SETUP_DONE ? "ready" : "failed");
     g_running = false;
     return NULL;

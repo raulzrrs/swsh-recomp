@@ -25,6 +25,7 @@ enum {
     SETUP_FAIL_COPY,        // disk full / unreadable files
     SETUP_FAIL_BUILD,       // the game code didn't build
     SETUP_FAIL_TOOLS,       // the generator / compiler are missing from this copy
+    SETUP_FAIL_IMAGE,       // the game data image (romfs.bin) isn't a whole RomFS the game can read
 };
 
 // The game files in <data root>/extracted: ready to play (exefs, romfs.bin and game code built for this version).

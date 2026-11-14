@@ -9,6 +9,7 @@
 
 #include "../hle.h"
 #include "../mods.h"
+#include "../romfs_build.h"
 #include "../ipc.h"
 
 #define FS_PATH_NOT_FOUND MAKE_RESULT(2, 1)
@@ -398,6 +399,9 @@ static Service *open_romfs_storage(void) {
         snprintf(path, sizeof path, "%s.bin", g_romfs_dir);  // extracted/romfs.bin
         romfs_fd = open(path, O_RDONLY);
         if (romfs_fd < 0) FATAL("cannot open %s (set up the game files on the start screen)\n", path);
+        char why[128];  // (not a whole RomFS: the game stopped at its first read, or at its first missing file - issue #10)
+        if (!romfs_image_ok(path, why, sizeof why))
+            FATAL("%s is not a game data image the game can read (%s): set up the game files again on the start screen\n", path, why);
         rom_index(romfs_fd);
         shader_prep_romfs(romfs_fd, romfs_each);
     }
