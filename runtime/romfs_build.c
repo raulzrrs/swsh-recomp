@@ -20,8 +20,8 @@
 #include <windows.h>
 #endif
 
-#define ROMFS_GAME_FILES 41702  // (Sword 1.3.2's image, the update merged: counted. The log's "romfs index" adds mods' new files)
-#define ROMFS_MIN_FILES 30000   // (well below a whole game, far above a mod's romfs: 551 files in issue #10)
+#define ROMFS_GAME_FILES 50494  // (Sword 1.3.2 with the update merged, counted; 1.0.0 alone has 41702)
+#define ROMFS_MIN_FILES 30000   // (well below either, far above a mod's romfs: 551 files in issue #10)
 #define EMPTY 0xFFFFFFFFu
 #define DATA_START 0x200u
 

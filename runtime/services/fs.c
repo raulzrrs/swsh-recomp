@@ -385,11 +385,17 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
         }
         if (n < 0) LOG("[fs] storage read failed at %llx: %s\n", off, strerror(errno));
         {
-            const char *path = romfs_file_at(off);
+            // LARECOMP_LOG_FILES=1: each file the game reads. A mod's file is served from past the image's end, where
+            // the image's own table doesn't reach: it is named by its path on the disk instead (issue #17: the last
+            // one read before a crash is the broken file of a mod).
+            const char *path = romfs_file_at(off), *mod = NULL;
+            for (int i = 0; !path && i < ov_n; i++)
+                if (off >= ov[i].start && off < ov[i].start + ov[i].size && !ov[i].mem) mod = ov[i].path;
             static const char *last;
-            if (path && path != last) {
-                last = path;
-                if (getenv("LARECOMP_LOG_FILES")) LOG("[fs] read %s\n", path);
+            const char *now = path ? path : mod;
+            if (now && now != last) {
+                last = now;
+                if (ENV("LARECOMP_LOG_FILES")) LOG("[fs] read %s%s\n", mod ? "(mod) " : "", now);
             }
         }
         static uint64_t reads, bytes;
