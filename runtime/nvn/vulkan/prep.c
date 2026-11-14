@@ -35,6 +35,10 @@
 
 #include "../../rt.h"
 #include "../../paths.h"
+
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
 #include "shaders.h"
 #include "vk.h"
 
@@ -493,10 +497,17 @@ static _Atomic int g_next_stage;
 static _Atomic int g_files_done, g_stages_done, g_running;
 static _Atomic uint64_t g_end_ns;
 static int g_phase_stage;  // STAGE_VERTEX, then STAGE_FRAGMENT
+// Started from the start screen (shader_prep_start_image): its threads run below normal priority, as many as the CPU
+// has to spare, while nothing else needs it. Once the game runs (g_in_game) they drop to idle priority and only the
+// first g_game_threads of them go on taking stages, so the preparation never competes with the game's frames.
+static _Atomic int g_from_launcher, g_in_game, g_complete, g_game_threads = 1, g_thread_seq;
+static _Atomic uint64_t g_build_t0;  // (when the stage building began: the rate since then gives the time left)
 
 static void *prep_thread(void *a) {
     (void)a;
-    plat_thread_idle();
+    int me = atomic_fetch_add(&g_thread_seq, 1);
+    bool lowered = !atomic_load(&g_from_launcher) || atomic_load(&g_in_game);
+    if (lowered) plat_thread_idle(); else plat_thread_background();
     if (g_phase_stage < 0) {  // (scan)
         // The executables too, as loaded: the game keeps shaders of its own in main (BNSH 2.1.11 containers, 14
         // of the stages a town and a battle drew that no file has). One thread takes them.
@@ -509,7 +520,13 @@ static void *prep_thread(void *a) {
         return NULL;
     }
     int i;
-    while ((i = atomic_fetch_add(&g_next_stage, 1)) < STAGE_CAP) {
+    for (;;) {
+        if (!lowered && atomic_load(&g_in_game)) {  // (the game started: idle priority, and fewer threads)
+            plat_thread_idle();
+            lowered = true;
+        }
+        if (lowered && atomic_load(&g_from_launcher) && me >= atomic_load(&g_game_threads)) break;
+        if ((i = atomic_fetch_add(&g_next_stage, 1)) >= STAGE_CAP) break;
         Stage *s = &g_stages[i];
         if (!s->code || s->stage != g_phase_stage) continue;
         while (vk_shader_jobs_waiting()) SDL_DelayNS(2 * 1000000ull);  // (a draw's own builds go first)
@@ -531,6 +548,8 @@ static void *phase_thread(void *a) {
 // keeps them (the parts themselves are in the driver's own cache, and vk_parts.bin is written at exit).
 static void run_phase(int phase, int n) {
     g_phase_stage = phase;
+    atomic_store(&g_thread_seq, 0);
+    if (phase >= 0 && !atomic_load(&g_build_t0)) atomic_store(&g_build_t0, SDL_GetTicksNS());
     atomic_store(&g_next_stage, 0);
     atomic_store(&g_live, n);
     pthread_t t[64];
@@ -558,14 +577,20 @@ static void *prep_main(void *a) {
     inflight_recover();
     if (complete_check()) {
         LOG("[prep] already done for this build, GPU and driver\n");
+        atomic_store(&g_complete, 1);
         return NULL;
     }
-    int n = SDL_GetNumLogicalCPUCores() / 2;
+    int cores = SDL_GetNumLogicalCPUCores(), n = cores / 2;
     const char *e = getenv("LARECOMP_SHADER_PREP");
     if (e && atoi(e) > 0) n = atoi(e);
     if (n < 1) n = 1;
     if (n > 8 && !(e && atoi(e) > 0)) n = 8;
     if (n > 64) n = 64;
+    atomic_store(&g_game_threads, n);
+    if (atomic_load(&g_from_launcher) && !(e && atoi(e) > 0)) {  // (the start screen: all but two of the CPU's threads)
+        int l = cores - 2;
+        n = l < n ? n : l > 32 ? 32 : l;
+    }
     uint64_t t0 = SDL_GetTicksNS();
     LOG("[prep] %d files (%.0f MB) to scan for shaders, %d threads, %d parts done before\n", g_nfiles, g_bytes / 1e6, n, g_ndone);
     atomic_store(&g_running, 1);
@@ -588,6 +613,7 @@ static void *prep_main(void *a) {
     done_save();
     complete_write();
     atomic_store(&g_end_ns, SDL_GetTicksNS());
+    atomic_store(&g_complete, 1);
     atomic_store(&g_running, 0);
     LOG("[prep] done in %.0f s (cache written in %.1f s)\n", (SDL_GetTicksNS() - t0) / 1e9, (SDL_GetTicksNS() - ts) / 1e9);
     if (getenv("LARECOMP_SHADER_PREP_EXIT")) {  // (tests: a first start that only prepares, then a run that plays)
@@ -615,11 +641,70 @@ int shader_prep_progress(float *frac) {
     return 0;
 }
 
-void shader_prep_romfs(int fd, void (*each)(int, void (*)(const char *, int, uint64_t, uint64_t, void *), void *)) {
-    static bool started;
+static _Atomic bool g_started;
+
+// Seconds left, from the rate since the stage building began (-1: not known yet). The scan comes first (~30 s).
+float shader_prep_eta(void) {
+    uint64_t t0 = atomic_load(&g_build_t0);
+    int done = atomic_load(&g_stages_done);
+    if (!atomic_load(&g_running) || !t0 || done < 200 || !g_nstages) return -1;
+    double rate = done / ((SDL_GetTicksNS() - t0) / 1e9);  // stages per second
+    int left = g_nstages - done;
+    if (atomic_load(&g_in_game) && atomic_load(&g_from_launcher)) rate /= 2;  // (fewer threads once the game runs)
+    return rate > 0 ? (float)(left > 0 ? left / rate : 0) : -1;
+}
+
+// 0 not started (or off), 1 preparing, 2 done for this build, GPU and driver (now or before).
+int shader_prep_state(void) {
+    if (atomic_load(&g_complete)) return 2;
+    return atomic_load(&g_started) ? 1 : 0;
+}
+
+// The start screen starts the preparation as soon as the game files are set up (ui/launcher_lg.mm), so it runs while
+// the player looks at the options instead of during the first minutes of play. It reads the image's file table itself
+// (the game's own index, services/fs.c rom_index, belongs to the game's boot, mods and all): every file's name and its
+// data's place in the image are all the preparation needs. The executables' own stages (14) are taken at the game's
+// boot only, where the modules are loaded; their draws build them then, as before the preparation existed.
+bool shader_prep_start_image(const char *romfs_bin) {
     const char *e = getenv("LARECOMP_SHADER_PREP");
-    if (started || (e && !strcmp(e, "0"))) return;
-    started = true;
+    if (atomic_load(&g_started) || (e && !strcmp(e, "0"))) return atomic_load(&g_started);
+    int fd = open(romfs_bin, O_RDONLY | O_BINARY);
+    if (fd < 0) return false;
+    uint64_t h[10];
+    if (pread(fd, h, sizeof h, 0) != (ssize_t)sizeof h || h[0] != 0x50 || !h[8] || h[8] > (64ull << 20)) { close(fd); return false; }
+    uint8_t *meta = malloc(h[8]);
+    if (!meta || pread(fd, meta, h[8], (off_t)h[7]) != (ssize_t)h[8]) { free(meta); close(fd); return false; }
+    for (uint64_t o = 0; o + 0x20 <= h[8];) {  // (parent, sibling, data offset, size, hash, name length, name)
+        uint64_t data, size;
+        uint32_t namelen;
+        memcpy(&data, meta + o + 8, 8);
+        memcpy(&size, meta + o + 0x10, 8);
+        memcpy(&namelen, meta + o + 0x1C, 4);
+        char name[256];
+        uint32_t nl = namelen > 255 ? 255 : namelen;
+        if (o + 0x20 + nl > h[8]) break;
+        memcpy(name, meta + o + 0x20, nl);
+        name[nl] = 0;
+        add_file(name, fd, h[9] + data, size, NULL);
+        o += 0x20 + ((namelen + 3ull) & ~3ull);
+    }
+    free(meta);
+    if (!g_nfiles) { close(fd); return false; }
+    atomic_store(&g_started, true);
+    atomic_store(&g_from_launcher, 1);
+    g_fd = fd;
+    LOG("[prep] started from the start screen: %d files\n", g_nfiles);
+    pthread_t t;
+    pthread_create(&t, NULL, prep_main, NULL);
+    pthread_detach(t);
+    return true;
+}
+
+void shader_prep_romfs(int fd, void (*each)(int, void (*)(const char *, int, uint64_t, uint64_t, void *), void *)) {
+    atomic_store(&g_in_game, 1);  // (the game opened its files: a preparation the start screen began steps aside)
+    const char *e = getenv("LARECOMP_SHADER_PREP");
+    if (atomic_load(&g_started) || (e && !strcmp(e, "0"))) return;
+    atomic_store(&g_started, true);
     each(fd, add_file, NULL);
     if (!g_nfiles) return;
     g_fd = dup(fd);  // (the fs service closes its own on a reboot)

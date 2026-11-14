@@ -38,6 +38,10 @@ bool vk_frame_begin(const float clear[4]);
 void vk_frame_end(const char *shot_path);
 void *vk_frame_cmd(void);
 bool vk_imgui_backend_init(void);
+bool shader_prep_start_image(const char *romfs_bin);  // runtime/nvn/vulkan/prep.c
+int shader_prep_state(void);
+int shader_prep_progress(float *frac);
+float shader_prep_eta(void);
 void vk_imgui_backend_shutdown(void);
 bool swsh60_supported(const char *exefs);  // runtime/hle/swsh60.c
 }
@@ -407,7 +411,6 @@ static bool window_button(const char *id, bool close, float size) {
 
 // ------------------------------------------------------------------ the start screen
 extern "C" void launcher_lg_run(const char *root) {
-    (void)root;
     ui_pick_language();
     g_pt = g_ui_lang == 1;
     ui_window_init();
@@ -470,6 +473,11 @@ extern "C" void launcher_lg_run(const char *root) {
         }
         last_install = inst;
         bool ready = !setup_running() && setup_ready();
+        if (ready && !shader_prep_state()) {  // (shaders prepared here, while the options are looked at: nvn/vulkan/prep.c)
+            char img[1100];
+            snprintf(img, sizeof img, "%s/romfs.bin", root && *root ? root : "extracted");
+            shader_prep_start_image(img);
+        }
         if (autoplay && ready && inst != MOD_INSTALL_RUNNING) play = true;
         if (!vk_frame_begin(bg)) { SDL_Delay(16); continue; }
         if (keys_test && strchr(keys_test, ':') && frame == 5) {  // "<slot>:<key name>": the key pressed for the test
@@ -540,7 +548,28 @@ extern "C" void launcher_lg_run(const char *root) {
                 dl->AddText(ImVec2(a.x + in, a.y + (row_h - ts.y) * 0.5f), ImGui::GetColorU32(ImGuiCol_Text), names[t]);
             }
             float play_h = 64 * s;
-            ImGui::SetCursorPosY(fmaxf(ImGui::GetCursorPosY(), ImGui::GetWindowHeight() - pad - play_h));
+            // the shader preparation, above Play: a bar, the share done and the time left (nvn/vulkan/prep.c)
+            int prep = ready ? shader_prep_state() : 0;
+            float prep_frac = 0;
+            bool preparing = prep == 1 && shader_prep_progress(&prep_frac) == 1;
+            float card_h = preparing ? ImGui::GetTextLineHeightWithSpacing() * 2 + 20 * s : 0;
+            ImGui::SetCursorPosY(fmaxf(ImGui::GetCursorPosY(), ImGui::GetWindowHeight() - pad - play_h - card_h));
+            if (preparing) {  // (two short lines: the sidebar is narrow)
+                float eta = shader_prep_eta();
+                char line[64];
+                if (eta < 0) snprintf(line, sizeof line, "%.0f%%", prep_frac * 100);
+                else if (eta < 90) snprintf(line, sizeof line, "%.0f%%  ·  ~%.0f s", prep_frac * 100, eta);
+                else snprintf(line, sizeof line, "%.0f%%  ·  ~%.0f min", prep_frac * 100, ceilf(eta / 60));
+                ImGui::TextUnformatted(T("Preparing shaders", "Preparando shaders"));
+                ImGui::TextDisabled("%s", line);
+                ImGui::ProgressBar(prep_frac, ImVec2(-FLT_MIN, 6 * s), "");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", T("Every shader of the game is compiled for your GPU, once (again after a driver update). "
+                                              "Play now and the game may stutter until it's done.",
+                                              "Todo shader do jogo é compilado para a sua GPU, uma vez (de novo depois de atualizar o driver). "
+                                              "Se jogar agora, o jogo pode engasgar até terminar."));
+                ImGui::Dummy(ImVec2(0, 8 * s));
+            }
             ImGui::PushStyleColor(ImGuiCol_Button, gold);
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, gold_hover);
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, gold_hover);
@@ -549,11 +578,33 @@ extern "C" void launcher_lg_run(const char *root) {
             ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0);
             ImGui::BeginDisabled(!ready);
             if (frame == 0 && ready) ImGui::SetKeyboardFocusHere();
-            if (ImGui::Button(T("Play", "Jogar"), ImVec2(-FLT_MIN, play_h))) play = true;
+            if (ImGui::Button(T("Play", "Jogar"), ImVec2(-FLT_MIN, play_h))) {
+                if (preparing) ImGui::OpenPopup("##prepwarn");
+                else play = true;
+            }
             ImGui::EndDisabled();
             ImGui::PopStyleVar();
             ImGui::PopFont();
             ImGui::PopStyleColor(4);
+            // Play while the shaders are being prepared: say what that costs (the preparation goes on, slower, in game)
+            ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+            ImGui::SetNextWindowSize(ImVec2(420 * s, 0));
+            if (ImGui::BeginPopupModal("##prepwarn", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::PushTextWrapPos(0);
+                ImGui::Text(g_pt ? "Os shaders ainda estão sendo preparados (%.0f%%)." : "The shaders are still being prepared (%.0f%%).",
+                            prep_frac * 100);
+                ImGui::TextUnformatted(T("The game can stutter the first time it meets an effect or an area until it's done. "
+                                         "The preparation goes on in the background, more slowly.",
+                                         "O jogo pode engasgar na primeira vez que encontrar um efeito ou uma área até terminar. "
+                                         "A preparação continua em segundo plano, mais devagar."));
+                ImGui::PopTextWrapPos();
+                ImGui::Spacing();
+                float bw = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+                if (ImGui::Button(T("Wait", "Esperar"), ImVec2(bw, 0)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
+                ImGui::SameLine();
+                if (ImGui::Button(T("Play anyway", "Jogar mesmo assim"), ImVec2(bw, 0))) { play = true; ImGui::CloseCurrentPopup(); }
+                ImGui::EndPopup();
+            }
             if (!ready && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                 ImGui::SetTooltip("%s", T("Set up the game files first (Game page).", "Configure os arquivos do jogo antes (página Jogo)."));
         }
