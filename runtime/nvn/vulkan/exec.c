@@ -3256,7 +3256,10 @@ bool vk_guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *
     return guest_direct(addr, size, buf, off);
 }
 
-static int g_cs_n;  // (compute program table below)
+// Compute programs by key, for the whole session: a table that grows (map_put; compute_program below). It was a fixed
+// 256 entries searched one by one, and a program past the 256th was never kept: every dispatch of it translated and
+// compiled it again (~200 ms with the frame waiting on it, and a leaked program each time).
+static Map cs_tab = {.name = "compute program"};
 
 // In-place reboot (device.c backend_reset; GPU idle): drop what is keyed by guest addresses - programs by code
 // address (the old Prog / Pipe objects are leaked, so pipeline keys holding their pointers can't collide), compute
@@ -3264,7 +3267,7 @@ static int g_cs_n;  // (compute program table below)
 void vk_exec_reset(void) {
     map_clear(&prog_tab);
     map_clear(&pipe_tab);
-    g_cs_n = 0;
+    map_clear(&cs_tab);
     ngpuw = 0;  // (guest memory is replaced)
     gcopy_gen++;
     pc_reset();
@@ -3418,20 +3421,17 @@ static void build_compute(void *arg) {
     if (r != VK_SUCCESS) LOG("[compute] pipeline failed: %d\n", r);
 }
 
-static struct CsEnt { uint64_t addr; CsProg *cp; } g_cs_tab[256];  // compute programs by code address
-
 static CsProg *compute_program(NvnProgram *np) {
     NvnShaderStage *ss = &np->stages[5];
     if (!ss->code_addr) return NULL;
-    struct CsEnt *tab = g_cs_tab;
-    int n = g_cs_n;
     // keyed by content when known: the game reuses its shader memory between areas, and a key by address returned the
     // translation of the shader that was there before (G4, the black rug: the same bug in the graphics programs)
     uint64_t ch = stage_hash_rt(ss);
     uint64_t key = ch ? ch : ss->code_addr;
-    for (int i = 0; i < n; i++) if (tab[i].addr == key) return tab[i].cp;
+    CsProg *found = map_get(&cs_tab, key);
+    if (found) return found;
     CsProg *cp = calloc(1, sizeof *cp);
-    if (n < 256) { tab[n].addr = key; tab[n].cp = cp; g_cs_n = n + 1; }
+    map_put(&cs_tab, key, cp, 256);
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
     ShaderKey k = {0};
