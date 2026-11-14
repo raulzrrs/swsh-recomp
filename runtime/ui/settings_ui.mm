@@ -496,10 +496,12 @@ void ui_tabs_begin(int *current, int count) {
 // (Let's Go Recomp's page also has SSAO, GI, the shadow filter, TAA, FSR 3.1 and frame generation: they read that game's
 // scene passes and motion vectors, not ported to Sword's renderer)
 static const char *const *graphics_labels(int *n) {
-    static const char *l[2];
+    static const char *l[4];
     l[0] = UI_T("Frame rate", "Taxa de quadros", "Частота кадров");
     l[1] = UI_T("Anti-aliasing", "Antisserrilhado", "Сглаживание");
-    *n = 2;
+    l[2] = UI_T("Anisotropic filtering", "Filtro anisotrópico", "Анизотропная фильтрация");
+    l[3] = UI_T("Show FPS", "Mostrar FPS", "Показывать FPS");
+    *n = 4;
     return l;
 }
 
@@ -537,6 +539,21 @@ void ui_page_graphics(float x, bool known) {
         ui_tip(UI_T("Smooths jagged edges (SMAA, on the final image).", "Suaviza os serrilhados (SMAA, na imagem final).",
                     "Сглаживает зубчатые края (SMAA, на итоговом кадре)."));
     }
+    {   // (runtime/nvn/vulkan/textures.c: read once, the samplers are kept)
+        const char *af[] = {UI_T("The game's", "Do jogo", "Как в игре"), "2x", "4x", "8x", "16x"};
+        static const int lv[] = {0, 2, 4, 8, 16};
+        int v = 0;
+        for (int i = 0; i < 5; i++) if (lv[i] == g_settings.aniso) v = i;
+        ui_row(l[2], x);
+        if (ui_combo("##aniso", &v, af, 5)) g_settings.aniso = lv[v];
+        ui_tip(UI_T("Keeps textures sharp at grazing angles (paths, grass towards the horizon). Almost free on a dedicated "
+                    "GPU. Takes effect the next time the game starts.",
+                    "Mantém as texturas nítidas vistas de lado (caminhos, grama no horizonte). Quase de graça numa GPU "
+                    "dedicada. Vale na próxima vez que o jogo abrir.",
+                    "Сохраняет чёткость текстур под острым углом. Применяется при следующем запуске."));
+    }
+    ui_toggle("##showfps", l[3], x, &g_settings.show_fps);
+    ui_tip(UI_T("The frame rate in a corner of the screen.", "A taxa de quadros num canto da tela.", "Частота кадров в углу экрана."));
     settings_apply_levels();
 }
 

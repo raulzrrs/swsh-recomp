@@ -11,6 +11,7 @@
 #include "vk.h"
 #include "../astc.h"
 #include "../renderer.h"
+#include "../../settings.h"
 
 // ================================================================== formats
 // expand_rgb: converted to RGBA8 on upload - 1 RGB8, 2 RGBA4 and 3 RGB5A1 (16-bit, red in the low bits: the
@@ -910,9 +911,10 @@ VkSampler vk_sampler(NvnSamplerDesc *d) {
     if (d->max_aniso > 1) { si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = fminf(d->max_aniso, 16); }
     // Anisotropic filtering raised to 16x (textures stay sharp at grazing angles: paths and grass towards the top of
     // the screen): the game asks for little or none, sized for the Switch. Mipmapped, linearly filtered colour samplers
-    // only. LARECOMP_ANISO=<n> chooses (0 or 1: the game's own).
+    // only. The Graphics page's Anisotropic filtering (settings aniso: 0 the game's own, 2 to 16), read once: samplers
+    // are kept, so a change takes effect at the next start. LARECOMP_ANISO=<n> overrides it.
     static int aniso = -1;
-    if (aniso < 0) aniso = getenv("LARECOMP_ANISO") ? atoi(getenv("LARECOMP_ANISO")) : 16;
+    if (aniso < 0) aniso = getenv("LARECOMP_ANISO") ? atoi(getenv("LARECOMP_ANISO")) : g_settings.aniso;
     if (aniso > 1 && mf >= 2 && si.minFilter == VK_FILTER_LINEAR && !d->compare_mode) {
         si.anisotropyEnable = VK_TRUE;
         si.maxAnisotropy = fmaxf(si.maxAnisotropy, fminf((float)aniso, 16));
