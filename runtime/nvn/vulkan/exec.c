@@ -3421,6 +3421,31 @@ static void build_compute(void *arg) {
     if (r != VK_SUCCESS) LOG("[compute] pipeline failed: %d\n", r);
 }
 
+static void cs_recipe_record(uint64_t ch, uint32_t co, const uint32_t local[3]);  // (compute recipes, below)
+
+// A compute program for this key: translated here, its pipeline built on a worker - right away for a dispatch, on the
+// low-priority queue for a compute recipe's prewarm (below), which a dispatch can still claim (wait_built).
+static CsProg *compute_make(uint64_t key, uint64_t code, uint32_t co, const uint32_t local[3], bool prewarm) {
+    CsProg *cp = calloc(1, sizeof *cp);
+    map_put(&cs_tab, key, cp, 256);
+    maxwell_gmem_base = HEAP_BASE;
+    maxwell_gmem_size = HEAP_MAX;
+    ShaderKey k = {0};
+    k.glsl = 1;
+    cp->si = maxwell_translate((const uint8_t *)(uintptr_t)code, co ? co : 0x10000, STAGE_COMPUTE, &k);
+    cp->p.vi = cp->si;
+    if (!cp->si->msl) {
+        LOG("[compute] translate failed: %s (code %llx)\n", cp->si->error, (unsigned long long)code);
+        atomic_store(&cp->p.state, 2);
+        return cp;
+    }
+    for (int i = 0; i < 3; i++) cp->local[i] = local[i] ? local[i] : 1;
+    save_glsl(cp->si->msl, code, "cs");
+    if (prewarm) run_job_low(build_compute, cp);
+    else run_job(build_compute, cp);
+    return cp;
+}
+
 static CsProg *compute_program(NvnProgram *np) {
     NvnShaderStage *ss = &np->stages[5];
     if (!ss->code_addr) return NULL;
@@ -3430,25 +3455,10 @@ static CsProg *compute_program(NvnProgram *np) {
     uint64_t key = ch ? ch : ss->code_addr;
     CsProg *found = map_get(&cs_tab, key);
     if (found) return found;
-    CsProg *cp = calloc(1, sizeof *cp);
-    map_put(&cs_tab, key, cp, 256);
-    maxwell_gmem_base = HEAP_BASE;
-    maxwell_gmem_size = HEAP_MAX;
-    ShaderKey k = {0};
-    k.glsl = 1;
-    cp->si = maxwell_translate((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, STAGE_COMPUTE, &k);
-    cp->p.vi = cp->si;
-    if (!cp->si->msl) {
-        LOG("[compute] translate failed: %s (code %llx)\n", cp->si->error, (unsigned long long)ss->code_addr);
-        atomic_store(&cp->p.state, 2);
-        return cp;
-    }
-    for (int i = 0; i < 3; i++) {
-        cp->local[i] = ss->control ? *(const uint32_t *)(ss->control + 0x748 + 4 * i) : 1;
-        if (!cp->local[i]) cp->local[i] = 1;
-    }
-    save_glsl(cp->si->msl, ss->code_addr, "cs");
-    run_job(build_compute, cp);
+    uint32_t local[3];
+    for (int i = 0; i < 3; i++) local[i] = ss->control ? *(const uint32_t *)(ss->control + 0x748 + 4 * i) : 1;
+    CsProg *cp = compute_make(key, ss->code_addr, ss->const_offset, local, false);
+    if (ch && cp->si && cp->si->msl) cs_recipe_record(ch, ss->const_offset, cp->local);
     return cp;
 }
 
@@ -3680,6 +3690,8 @@ static void recipes_load(void) {
     qsort(g_rec_by_stage, (size_t)g_nrec_by_stage, sizeof *g_rec_by_stage, cmp_rec_stage);
     stat_recipe_loaded = (uint64_t)g_nrecipes;
     LOG("[recipes] %d pipeline recipes from %s%s\n", g_nrecipes, path, bad ? " (invalid records skipped)" : "");
+    extern void cs_recipes_load_ext(void);
+    cs_recipes_load_ext();
 }
 
 void renderer_stage_seen(uint64_t h, uint64_t addr, uint32_t co, uint32_t size) {
@@ -3766,7 +3778,92 @@ static void recipe_record(const Prog *pr, const PipeKey *k) {
     stat_recipe_recorded++;
 }
 
+// ---- compute recipes: <cache>/compute_recipes_v1.bin, every compute program a dispatch built on this PC - its code's
+// content hash, its constants' offset and its group size (from the program's control data, which the shader
+// preparation can't know: the reason compute stages were the hitches left after it, ~230 ms each, once per driver).
+// When the game hands that code over again (renderer_stage_seen), the pipeline is built on the low-priority queue
+// before the first dispatch needs it. Same checks as the graphics recipes; LARECOMP_PIPE_RECIPES=0 turns both off.
+#define CS_RECIPE_MAGIC 0x50434352u  // "RCCP"
+typedef struct { uint32_t magic, version; uint64_t chash; uint32_t co, local[3]; uint64_t check; } CsRecipe;
+static CsRecipe *g_cs_rec;      // on file, sorted by hash
+static int g_ncs_rec;
+static CsRecipe *g_cs_rec_out;  // recorded this run, not yet appended
+static int g_ncs_rec_out, g_cap_cs_rec_out;
+static uint64_t stat_cs_prewarmed;
+
+static uint64_t cs_recipe_check(const CsRecipe *r) { return hash_words(0x5243435052434350ull, r, offsetof(CsRecipe, check)) | 1; }
+
+static void cs_recipe_path(char *out, size_t n) {
+    extern const char *rt_cache_dir(void);
+    snprintf(out, n, "%s/compute_recipes_v1.bin", rt_cache_dir());
+}
+
+static int cmp_cs_rec(const void *a, const void *b) {
+    uint64_t x = ((const CsRecipe *)a)->chash, y = ((const CsRecipe *)b)->chash;
+    return x < y ? -1 : x > y;
+}
+
+void cs_recipes_load_ext(void);  // (recipes_load, above, loads these too)
+static void cs_recipes_load(void);
+void cs_recipes_load_ext(void) { cs_recipes_load(); }
+
+static void cs_recipes_load(void) {
+    char path[600];
+    cs_recipe_path(path, sizeof path);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    CsRecipe r;
+    int cap = 0;
+    while (fread(&r, sizeof r, 1, f) == 1) {
+        if (r.magic != CS_RECIPE_MAGIC || r.version != 1 || r.check != cs_recipe_check(&r) || !r.chash) continue;
+        if (!recipe_known_add(r.check)) continue;
+        if (g_ncs_rec == cap) { cap = cap ? cap * 2 : 256; g_cs_rec = realloc(g_cs_rec, (size_t)cap * sizeof *g_cs_rec); }
+        g_cs_rec[g_ncs_rec++] = r;
+    }
+    fclose(f);
+    qsort(g_cs_rec, (size_t)g_ncs_rec, sizeof *g_cs_rec, cmp_cs_rec);
+    LOG("[recipes] %d compute recipes from %s\n", g_ncs_rec, path);
+}
+
+static void cs_recipe_record(uint64_t ch, uint32_t co, const uint32_t local[3]) {
+    if (!recipes_on()) return;
+    CsRecipe r;
+    memset(&r, 0, sizeof r);
+    r.magic = CS_RECIPE_MAGIC;
+    r.version = 1;
+    r.chash = ch;
+    r.co = co;
+    memcpy(r.local, local, sizeof r.local);
+    r.check = cs_recipe_check(&r);
+    if (!recipe_known_add(r.check)) return;
+    if (g_ncs_rec_out == g_cap_cs_rec_out) {
+        g_cap_cs_rec_out = g_cap_cs_rec_out ? g_cap_cs_rec_out * 2 : 64;
+        g_cs_rec_out = realloc(g_cs_rec_out, (size_t)g_cap_cs_rec_out * sizeof *g_cs_rec_out);
+    }
+    g_cs_rec_out[g_ncs_rec_out++] = r;
+}
+
+// A stage the game handed over: its compute recipe, if any, prewarmed (render thread, from recipes_pump)
+static void cs_recipe_seen(const StageSeen *s) {
+    int lo = 0, hi = g_ncs_rec;
+    while (lo < hi) { int m = (lo + hi) / 2; if (g_cs_rec[m].chash < s->h) lo = m + 1; else hi = m; }
+    if (lo >= g_ncs_rec || g_cs_rec[lo].chash != s->h || map_get(&cs_tab, s->h)) return;
+    if (!stage_still_there(s)) return;
+    compute_make(s->h, s->addr, g_cs_rec[lo].co, g_cs_rec[lo].local, true);
+    stat_cs_prewarmed++;
+}
+
 static void recipes_flush(void) {  // (with the stats line, every ~2 s: append what this run recorded)
+    if (g_ncs_rec_out) {
+        char path[600];
+        cs_recipe_path(path, sizeof path);
+        FILE *f = fopen(path, "ab");
+        if (f) {
+            fwrite(g_cs_rec_out, sizeof *g_cs_rec_out, (size_t)g_ncs_rec_out, f);
+            fclose(f);
+        }
+        g_ncs_rec_out = 0;
+    }
     if (!g_nrec_out) return;
     char path[600];
     recipe_path(path, sizeof path);
@@ -3783,7 +3880,7 @@ static void recipes_flush(void) {  // (with the stats line, every ~2 s: append w
 static void recipes_pump(void) {
     if (!recipes_on()) return;
     recipes_load();
-    if (!g_nrecipes) return;
+    if (!g_nrecipes && !g_ncs_rec) return;
     StageSeen in[256];
     pthread_mutex_lock(&g_stage_lock);
     int n = g_nstage_in < 256 ? g_nstage_in : 256;
@@ -3797,6 +3894,7 @@ static void recipes_pump(void) {
         bool fresh = !g_stage_tab[sl].h;
         g_stage_tab[sl] = in[i];
         if (!fresh) continue;  // (seen before: its recipes were queued then)
+        if (g_ncs_rec) cs_recipe_seen(&in[i]);  // (a compute stage: its pipeline ahead of the first dispatch)
         int lo = 0, hi = g_nrec_by_stage;  // first entry with this hash
         while (lo < hi) { int m = (lo + hi) / 2; if (g_rec_by_stage[m].h < in[i].h) lo = m + 1; else hi = m; }
         for (int e = lo; e < g_nrec_by_stage && g_rec_by_stage[e].h == in[i].h; e++) {
@@ -3859,6 +3957,10 @@ static void recipes_pump(void) {
 void recipes_stats(char *out, size_t n) {
     recipes_flush();
     if (!recipes_on()) return;
+    if (stat_cs_prewarmed) {  // (compute recipes prewarmed so far)
+        LOG("[recipes] %llu compute pipelines prewarmed\n", (unsigned long long)stat_cs_prewarmed);
+        stat_cs_prewarmed = 0;
+    }
     snprintf(out, n, " | recipes %llu: progs %llu pipes %llu adopted %llu new %llu (draw pipes %llu, no vs hash %llu, no fs hash %llu, dup %llu, stale %llu)",
              (unsigned long long)stat_recipe_loaded, (unsigned long long)stat_recipe_progs, (unsigned long long)stat_recipe_pipes,
              (unsigned long long)stat_recipe_adopted, (unsigned long long)stat_recipe_recorded, (unsigned long long)stat_pipes_drawn,
