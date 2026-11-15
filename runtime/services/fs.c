@@ -28,6 +28,7 @@ static Patch patches[8];
 static int npatches;
 static Overlay *ov;
 static int ov_n, ov_cap;
+static int ov_open;  // mod files open now (romfs_read: at most 128)
 static uint8_t *ov_meta;
 static uint64_t ov_meta_off, ov_meta_size, ov_end;
 // Lets the runtime see which game files are being streamed (e.g. which level is loading).
@@ -45,7 +46,7 @@ RT_ON_RESET(fs_reset) {
     for (int i = 0; i < npatches; i++) free(patches[i].data);  // (ov_meta and the extended table are among these)
     for (int i = 0; i < rom_nfiles; i++) free(rom_files[i].path);
     free(ov), free(rom_files);
-    ov = NULL, ov_n = ov_cap = 0;
+    ov = NULL, ov_n = ov_cap = ov_open = 0;
     ov_meta = NULL, ov_meta_off = ov_meta_size = ov_end = 0;
     npatches = 0;
     rom_files = NULL, rom_nfiles = 0, rom_data_off = 0;
@@ -322,8 +323,22 @@ static ssize_t romfs_read(int fd, uint8_t *dst, uint64_t size, uint64_t off) {
                 r = in < ov[i].size ? (ssize_t)(n < ov[i].size - in ? n : ov[i].size - in) : 0;
                 memcpy(dst + done, ov[i].mem + in, (size_t)r);
             } else {
-                if (ov[i].fd < 0) ov[i].fd = open(ov[i].path, O_RDONLY);
-                r = in < ov[i].size ? pread(ov[i].fd, dst + done, n < ov[i].size - in ? n : ov[i].size - in, (off_t)in) : 0;
+                // a mod's file stays open between reads, but no more than 128 at once (issue #17: a mod of 848 files
+                // kept every one open; Windows' C runtime allows 512 and the opens after that failed - the game read
+                // zeros where a texture's header was and stopped with 2002-6063 "out of range")
+                if (ov[i].fd < 0) {
+                    static int max_open = -1;  // (LARECOMP_FS_MOD_OPEN=<n>: another limit, a test of the closing)
+                    if (max_open < 0) max_open = ENV("LARECOMP_FS_MOD_OPEN") ? atoi(ENV("LARECOMP_FS_MOD_OPEN")) : 128;
+                    if (ov_open >= max_open) {
+                        for (int k = 0; k < ov_n; k++)
+                            if (ov[k].fd >= 0) close(ov[k].fd), ov[k].fd = -1;
+                        ov_open = 0;
+                    }
+                    ov[i].fd = open(ov[i].path, O_RDONLY);
+                    if (ov[i].fd >= 0) ov_open++;
+                    else LOG("[fs] mod file %s: cannot open (%s)\n", ov[i].path, strerror(errno));
+                }
+                r = in < ov[i].size && ov[i].fd >= 0 ? pread(ov[i].fd, dst + done, n < ov[i].size - in ? n : ov[i].size - in, (off_t)in) : 0;
             }
             if (r < 0) r = 0;
             if ((uint64_t)r < n) memset(dst + done + r, 0, n - r);
