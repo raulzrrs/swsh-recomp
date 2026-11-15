@@ -33,9 +33,12 @@ How to play
 On the first start the game's shaders are prepared for your graphics card in the background (about 6 minutes; the
 game runs slower meanwhile). After that, new places hitch much less. They are kept on disk (cache\, about 3 GB).
 
-Options (start screen, and F12 in the game): resolution, fullscreen, 30 / 60 fps, anti-aliasing (SMAA), brightness,
-contrast, saturation, volume, the controller layout (Nintendo / Xbox), the keys, and mods (several at once). More in
-larecomp.ini.
+Options (start screen, and F12 in the game): resolution, fullscreen, 30 / 60 fps, anti-aliasing (SMAA, TAA, NVIDIA
+DLAA), ambient occlusion, shadow resolution, brightness, contrast, saturation, volume, the controller layout (Nintendo /
+Xbox), the keys, the mouse, and mods (several at once). More in larecomp.ini.
+
+NVIDIA DLAA (RTX cards) needs NVIDIA's nvngx_dlss.dll next to SwShRecomp.exe (from NVIDIA's DLSS SDK,
+github.com/NVIDIA/DLSS, or another game that ships it); without it the DLAA choice is hidden and TAA does the job.
 
 Everything stays in this folder: settings (larecomp.ini), saves (save-sword\ or save-shield\), the game files
 (extracted\), shader caches
@@ -51,6 +54,9 @@ Controls
 Keyboard: WASD move, Space/Enter = A, Q/Backspace = B, Tab = X (menu), R = Y, Z/C = L/R, 1/3 = ZL/ZR, = and - = Plus/Minus,
 arrows = D-pad, numpad 8/4/5/6 = right stick (camera), Esc = close. All keys can be changed on the start screen.
 Controllers: any controller SDL recognizes (Xbox, PlayStation, Switch Pro...).
+Mouse: moving it turns the camera (the window holds the mouse; F12, Esc or Alt+Tab let it go). In a menu with the
+game's cursor it is a pointer: click an option to choose it. Left = A, right = B, middle = X (menu), wheel = up / down,
+side buttons = L / R.
 
 Troubleshooting
 ---------------

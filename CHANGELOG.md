@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.3.0 (2026-11-15)
+
+Better graphics and a real PC mouse: anti-aliasing with TAA or NVIDIA DLAA, ambient occlusion, sharper sun shadows,
+the camera turned by moving the mouse, and the menus' options clicked where they are. On the reference PC (RTX 3080)
+all of it holds 60 fps at 1440p and at 4K.
+
+### Graphics
+- **Anti-aliasing: TAA and NVIDIA DLAA** (Graphics → Anti-aliasing: Off / SMAA / TAA / DLAA). The scene is jittered a
+  fraction of a pixel each frame and resolved against the frames before it along the camera's motion, on the game's
+  HDR image before its bloom: edges, fences, windows and foliage stop stair-stepping and shimmering. DLAA is NVIDIA's
+  model in TAA's place (RTX cards: it shows when the driver and `nvngx_dlss.dll` next to `lasrecomp.exe` are found);
+  without them DLAA runs as TAA. It follows the game's dynamic resolution (the scene in 80% of the image in some areas).
+- **Ambient occlusion** (Graphics → Ambient occlusion: Off / Low / Medium / High): soft contact shadows under the
+  characters, at the foot of walls, in windows and in the grass (Let's Go Recomp's SSAO, fitted to Sword's scene).
+- **Sharper sun shadows**: the shadow map at 2x (default) or 4x (Graphics → Shadow resolution); shadows get a shape
+  instead of a blur.
+
+### Mouse
+- **The camera follows the mouse**, no button held, like a PC game (Controls → Camera with the mouse: always, while
+  the right button is held, or off; Mouse sensitivity sets its speed).
+- **Click the menus' options**: in a menu with the game's cursor (the X menu, the bag, the party, submenus...) the
+  mouse is a pointer, and a click on an option moves the game's own selection there and confirms it - done with the
+  d-pad and A, as a controller would, so the game's logic is untouched. Out of menus the mouse is the camera again,
+  by itself.
+- Left button A (outside a menu's options: advances text), right B, middle X (the menu), the wheel up / down in lists,
+  side buttons L / R (tabs, the box's pages).
+
+### Fixes
+- **Mods that replace hundreds of files no longer crash** with `2002-6063` (#17): every replaced file was kept open,
+  and past Windows' 512 the next ones failed to open and were read as zeros.
+- Fences recorded in the game's command lists are kept: the game waits for the GPU work it fenced (from Let's Go Recomp).
+- Compute shaders are built ahead from the ones recorded on this PC: the ~230 ms hold the first time each was used is
+  gone after the first session.
+
+### For testers and developers
+- `LARECOMP_LOG_FILES=1` names a mod's files too (`[fs] read (mod) <path>`); a mod file that cannot be opened is logged.
+- Soft sun shadows (PCSS) are in, experimental and off (`pcss = <percent>` in larecomp.ini): not yet fitted to Sword's map.
+- `tests/scenarios/xmenu*.json`, `LARECOMP_UI_CLICK` (a click in a scenario), `LARECOMP_UI_LOG` (a frame's menu panes).
+
 ## 0.2.0 (2026-11-14)
 
 Smooth 60 fps in the open world, battles and Max Raids on the reference PC (Core i5-14600KF, RTX 3080, 2560x1440):
