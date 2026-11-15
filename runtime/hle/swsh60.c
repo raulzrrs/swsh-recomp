@@ -45,6 +45,8 @@ void swsh60_configure(const char *exefs) {
     g_on = g_build && g_settings.fps == 60;
     g_applied = false;
     if (g_build) LOG("[swsh60] %s: 60 fps %s\n", g_build->name, g_on ? "on" : "off");
+    extern void uimouse_configure(bool sword132);  // (runtime/hle/uimouse.c: the mouse in the menus)
+    uimouse_configure(g_build == &k_builds[1]);
 }
 
 bool swsh60_enabled(void) { return g_on; }

@@ -77,6 +77,8 @@ add:
 }
 
 void rt_register_fnhook(uint64_t addr, FnHook fn) { reg(addr, fn, false); }
+// At this address of the running build as it is (not translated from Let's Go Eevee): Sword's hooks (runtime/hle/uimouse.c)
+void rt_register_fnhook_abs(uint64_t addr, FnHook fn) { reg(addr, fn, true); }
 
 void rt_fnhook_set_build(int build) {
     if (build == g_build) return;

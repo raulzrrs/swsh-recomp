@@ -1,0 +1,2 @@
+{"description": "The player's Shield save in Sword: the X menu opened (mouse menu research: its buttons' panes)",
+ "save": "build/scenario-saves/user-shield-2", "input": "600:A:8,800:A:8,950:X:8", "exit_at": 1200, "measure": [1000, 1150], "shots": [1100]}

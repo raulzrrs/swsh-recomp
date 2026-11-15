@@ -3,10 +3,12 @@
 // Both go through the player's bindings (runtime/hle/bindings.c, defaults there: keyboard WASD left stick, arrows
 // d-pad, Space (or Enter) = A, Q (or Backspace) = B, Tab = X, R = Y, Z / C = L / R, 1 / 3 = ZL / ZR, = / - = Plus /
 // Minus, numpad 8/4/5/6 right stick; controller by position, Switch A = east).
-// Mouse: while the game aims a Poke Ball (it started the motion sensor) the window holds it (relative mode): moving it
-// turns the virtual gyro, left click = A (throw). Otherwise it is free and is a finger on the touch screen (left
-// button held; Play with Eevee pets this way in handheld mode). Right click = B either way. The menu (Esc) or leaving
-// the window lets it go.
+// Mouse (Sword has no touch screen and no motion aiming: it reads buttons and sticks only): it is a controller.
+// The camera: the mouse's speed is the right stick's push (g_settings.mouse_cam: while the right button is held - the
+// window holds the mouse then -, always - the window holds it after a click, F12 / Esc / leaving the window let it go -,
+// or never). Left button = A, a right click (short, not a drag) = B, middle = X (the menu), the wheel = the d-pad up /
+// down (menus, lists: one step a notch; tilted: left / right), the side buttons = L / R (tabs, the box's pages).
+// While the game aims with the motion sensor (Let's Go's Poke Ball, kept) the window holds the mouse: the gyro.
 #include <SDL3/SDL.h>
 #include <ctype.h>
 #include <math.h>
@@ -100,14 +102,45 @@ static void recompute_pad(void) {
 
 // The mouse: held by the game window (relative mode) or free
 static SDL_Window *mouse_win;
+static int mouse_held_by;  // why the window holds it: 1 the gyro, 2 the camera's right-button drag, 3 the camera always
+static _Atomic int64_t mcam_acc_x, mcam_acc_y;  // camera motion not yet turned into the stick, in 1/1000 pixel
+static uint64_t rmb_down_ns;    // the right button's press (a short one without a drag is B)
+static int64_t rmb_moved;       // how far it dragged (pixels, both axes)
+// Buttons pressed briefly: the wheel's notches (queued: press, release, the next), a right click's B
+enum { PULSE_UP, PULSE_DOWN, PULSE_LEFT, PULSE_RIGHT, PULSE_B, PULSE_N };
+static _Atomic int pulse_pending[PULSE_N];
+static uint64_t pulse_press_until[PULSE_N], pulse_free_at[PULSE_N];
 static _Atomic int gyro_aiming;  // the game has the motion sensor started (aiming): the mouse turns the gyro
 static _Atomic int64_t mouse_acc_x, mouse_acc_y;  // motion not yet applied to the virtual gyro, in 1/1000 pixel
 static _Atomic int touch_down;
 static void mouse_release(void) {
     if (mouse_win) SDL_SetWindowRelativeMouseMode(mouse_win, false);
     mouse_win = NULL;
+    mouse_held_by = 0;
     mouse_buttons = 0;
     touch_down = 0;
+    mcam_acc_x = mcam_acc_y = 0;
+}
+static void mouse_hold(SDL_Window *w, int why) {
+    if (!w) return;
+    if (!mouse_win) SDL_SetWindowRelativeMouseMode(w, true);
+    mouse_win = w, mouse_held_by = why;
+    mcam_acc_x = mcam_acc_y = 0;
+}
+extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or name entry up (it has the keys / pad)
+// runtime/hle/uimouse.c: the game's menus (a menu with its cursor is up; a click there; the walk's buttons)
+extern bool uimouse_menu_active(void);
+extern bool uimouse_click(float x, float y);
+extern uint64_t uimouse_pad(void);
+// window coordinates -> the game image's 1920 x 1080 (the menus' layout pixels)
+static bool window_to_layout(SDL_Window *w, float mx, float my, float *x, float *y) {
+    float d = w ? SDL_GetWindowPixelDensity(w) : 1;
+    if (d <= 0) d = 1;
+    extern double g_present_rect[4];
+    double r0 = g_present_rect[0], r1 = g_present_rect[1], r2 = g_present_rect[2], r3 = g_present_rect[3];
+    if (r2 <= 0 || r3 <= 0) return false;
+    *x = (float)((mx * d - r0) / r2 * 1920), *y = (float)((my * d - r1) / r3 * 1080);
+    return true;
 }
 
 // Touch screen: the free mouse over the game image. The game is told it is docked (runtime/services/am.c: a 1920 x
@@ -233,32 +266,74 @@ void input_handle_event(const SDL_Event *e) {
         if (e->key.scancode < SDL_SCANCODE_COUNT) keys_down[e->key.scancode] = e->type == SDL_EVENT_KEY_DOWN;
         recompute_keyboard();
         break;
+    case SDL_EVENT_MOUSE_WHEEL: {
+        if (menu_input_captured()) break;
+        float wy = e->wheel.integer_y ? (float)e->wheel.integer_y : 0, wx = e->wheel.integer_x ? (float)e->wheel.integer_x : 0;
+        if (e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED) wy = -wy, wx = -wx;
+        for (int i = 0; i < (int)fabsf(wy) && i < 8; i++) pulse_pending[wy > 0 ? PULSE_UP : PULSE_DOWN]++;
+        for (int i = 0; i < (int)fabsf(wx) && i < 8; i++) pulse_pending[wx > 0 ? PULSE_RIGHT : PULSE_LEFT]++;
+        break;
+    }
     case SDL_EVENT_MOUSE_BUTTON_DOWN: case SDL_EVENT_MOUSE_BUTTON_UP: case SDL_EVENT_MOUSE_MOTION: {
         bool motion = e->type == SDL_EVENT_MOUSE_MOTION;
         SDL_Window *w = SDL_GetWindowFromID(motion ? e->motion.windowID : e->button.windowID);
-        // aiming: the window holds the mouse (the gyro); else it is free (the touch screen)
-        if (gyro_aiming && !mouse_win && w) {
-            mouse_win = w;
-            SDL_SetWindowRelativeMouseMode(w, true);
-            touch_down = 0;
-        } else if (!gyro_aiming && mouse_win) {
-            mouse_release();
+        if (menu_input_captured()) {  // (the F12 menu has the mouse)
+            if (mouse_win) mouse_release();
+            break;
         }
+        // aiming (the gyro) holds the mouse; the camera's drag / always mode too; else it is free
+        if (gyro_aiming && mouse_held_by != 1 && w) mouse_hold(w, 1);
+        else if (!gyro_aiming && mouse_held_by == 1) mouse_release();
+        // always: the mouse moving over the focused game window is held by it (the camera follows it at once; F12,
+        // Esc and leaving the window let it go, coming back takes it again) - except over a game menu with its cursor,
+        // where it is a pointer (runtime/hle/uimouse.c)
+        bool game_menu = uimouse_menu_active();
+        if (game_menu && mouse_held_by >= 2) mouse_release();
+        else if (!game_menu && g_settings.mouse_cam == 2 && !mouse_win && w && (SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS))
+            mouse_hold(w, 3);
         if (motion) {
-            if (mouse_win) {
+            if (mouse_held_by == 1) {
                 mouse_acc_x += (int64_t)(e->motion.xrel * 1000);
                 mouse_acc_y += (int64_t)(e->motion.yrel * 1000);
+            } else if (mouse_held_by >= 2) {
+                mcam_acc_x += (int64_t)(e->motion.xrel * 1000);
+                mcam_acc_y += (int64_t)(e->motion.yrel * 1000);
+                if (mouse_held_by == 2) rmb_moved += (int64_t)(fabsf(e->motion.xrel) + fabsf(e->motion.yrel));
             } else {
                 touch_at(w, e->motion.x, e->motion.y);
             }
             break;
         }
         bool down = e->type == SDL_EVENT_MOUSE_BUTTON_DOWN;
-        if (e->button.button == SDL_BUTTON_RIGHT) {
-            mouse_buttons = down ? mouse_buttons | 1ull << BTN_B : mouse_buttons & ~(1ull << BTN_B);
-        } else if (e->button.button == SDL_BUTTON_LEFT) {
-            if (mouse_win) mouse_buttons = down ? mouse_buttons | 1ull << BTN_A : mouse_buttons & ~(1ull << BTN_A);
-            else { touch_at(w, e->button.x, e->button.y); touch_down = down; }
+        int mode = g_settings.mouse_cam;
+        // always: a click into the window starts holding the mouse (that click is only that)
+        if (down && mode == 2 && !mouse_win && w && !game_menu) { mouse_hold(w, 3); break; }
+        uint8_t bt = e->button.button;
+        if (bt == SDL_BUTTON_RIGHT) {
+            if (mode == 1 && mouse_held_by != 1) {  // the camera's drag; a short click without one is B
+                if (down) { rmb_down_ns = SDL_GetTicksNS(), rmb_moved = 0; if (w) mouse_hold(w, 2); }
+                else if (mouse_held_by == 2) {
+                    bool click = rmb_moved < 12 && SDL_GetTicksNS() - rmb_down_ns < 350000000ull;
+                    mouse_release();
+                    if (click) pulse_pending[PULSE_B]++;
+                }
+            } else {
+                mouse_buttons = down ? mouse_buttons | 1ull << BTN_B : mouse_buttons & ~(1ull << BTN_B);
+            }
+        } else if (bt == SDL_BUTTON_LEFT) {
+            float lx, ly;  // (a game menu: a click on one of its buttons walks the selection there and presses A)
+            if (down && game_menu && !mouse_win && window_to_layout(w, e->button.x, e->button.y, &lx, &ly) && uimouse_click(lx, ly)) {
+                mouse_buttons &= ~(1ull << BTN_A);
+                break;
+            }
+            mouse_buttons = down ? mouse_buttons | 1ull << BTN_A : mouse_buttons & ~(1ull << BTN_A);
+            if (!mouse_win) { touch_at(w, e->button.x, e->button.y); touch_down = down; }  // (and a finger, for games that read one)
+        } else if (bt == SDL_BUTTON_MIDDLE) {
+            mouse_buttons = down ? mouse_buttons | 1ull << BTN_X : mouse_buttons & ~(1ull << BTN_X);
+        } else if (bt == SDL_BUTTON_X1) {
+            mouse_buttons = down ? mouse_buttons | 1ull << BTN_L : mouse_buttons & ~(1ull << BTN_L);
+        } else if (bt == SDL_BUTTON_X2) {
+            mouse_buttons = down ? mouse_buttons | 1ull << BTN_R : mouse_buttons & ~(1ull << BTN_R);
         }
         break;
     }
@@ -497,6 +572,45 @@ static int32_t clamp_axis(int32_t v) { return v > 32767 ? 32767 : v < -32767 ? -
 // {int64 sampling, u64 buttons, AnalogStick L {x,y}, AnalogStick R {x,y}, u32 attributes}
 static uint32_t npad_id_used(uint32_t *style);  // (below: which controller the player has)
 
+// The mouse's brief presses (wheel notches, a right click): each 50 ms down, 40 ms up before the next of its kind
+static uint64_t mouse_pulses(void) {
+    static const int bit[PULSE_N] = {BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_B};
+    uint64_t now = SDL_GetTicksNS(), b = 0;
+    for (int i = 0; i < PULSE_N; i++) {
+        if (now >= pulse_free_at[i] && pulse_pending[i] > 0) {
+            pulse_pending[i]--;
+            pulse_press_until[i] = now + 50000000ull, pulse_free_at[i] = pulse_press_until[i] + 40000000ull;
+        }
+        if (now < pulse_press_until[i]) b |= 1ull << bit[i];
+        if (pulse_pending[i] > 4) pulse_pending[i] = 4;  // (a fast spin does not scroll on for seconds)
+    }
+    return b;
+}
+
+// The camera from the mouse: its speed (pixels per second, smoothed over ~40 ms) as the right stick's push - full at
+// 120 / mouse_sens pixels a second (sensitivity 0.10: 1200), starting past the game's dead zone (a slow move turns
+// slowly instead of not at all). The game reads the controller several times a frame: the speed is measured over
+// at least 4 ms.
+static void mouse_camera(int32_t *rx, int32_t *ry) {
+    static uint64_t last;
+    static double vx, vy;
+    uint64_t now = SDL_GetTicksNS();
+    if (mouse_held_by < 2) { vx = vy = 0; last = now; mcam_acc_x = mcam_acc_y = 0; return; }
+    double dt = (now - last) / 1e9;
+    if (dt >= 0.004) {
+        double ax = atomic_exchange(&mcam_acc_x, 0) / 1000.0, ay = atomic_exchange(&mcam_acc_y, 0) / 1000.0;
+        double k = dt > 0.1 ? 1 : 1 - exp(-dt / 0.04);
+        vx += (ax / dt - vx) * k, vy += (ay / dt - vy) * k;
+        last = now;
+    }
+    double full = 120.0 / (g_settings.mouse_sens > 0.005 ? g_settings.mouse_sens : 0.1), dz = 0.18;
+    double sx = vx / full, sy = -vy / full;  // (mouse up: the stick up)
+    double m = sqrt(sx * sx + sy * sy);
+    if (m < 0.01) return;
+    double out = m > 1 ? 1 : dz + (1 - dz) * m;
+    *rx = (int32_t)lround(sx / m * out * 32767), *ry = (int32_t)lround(sy / m * out * 32767);
+}
+
 static void fill_state(Cpu *c) {
     uint8_t *s = (uint8_t *)(uintptr_t)c->x[0];
     uint32_t id = *(uint32_t *)(uintptr_t)c->x[1];
@@ -524,7 +638,10 @@ static void fill_state(Cpu *c) {
         if (renderer_game_frame() < until) b |= 1ull << BTN_PLUS;
     }
     int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly) + script_ly);
-    int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry) + script_ry);
+    if (!menu) b |= mouse_pulses() | uimouse_pad();
+    int32_t mrx = 0, mry = 0;
+    mouse_camera(&mrx, &mry);
+    int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx + mrx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry + mry) + script_ry);
     // d-pad / arrow keys walk (setting) while the stick is at rest. "At rest" has a dead zone: a controller's stick
     // never reads exactly 0 (a DualSense rests at a few hundred), which used to turn the d-pad off altogether.
     if (!menu && g_settings.dpad_move && (int64_t)lx * lx + (int64_t)ly * ly < 8000ll * 8000) {

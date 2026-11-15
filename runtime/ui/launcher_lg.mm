@@ -83,11 +83,12 @@ static void keys_section(void) {
     int cap_dev, cap_slot, ms_left;
     bind_capture_active(&cap_dev, &cap_slot, &ms_left);
     const size_t n = sizeof k_actions / sizeof k_actions[0];
-    const char *sl[] = {T("Mouse sensitivity", "Sensibilidade do mouse"), T("Controller stick dead zone", "Zona morta do analógico")};
-    const char *labels[sizeof k_actions / sizeof k_actions[0] + 2];  // (one values' column for the keys and the sliders)
+    const char *sl[] = {T("Mouse sensitivity", "Sensibilidade do mouse"), T("Controller stick dead zone", "Zona morta do analógico"),
+                        T("Camera with the mouse", "Câmera com o mouse")};
+    const char *labels[sizeof k_actions / sizeof k_actions[0] + 3];  // (one values' column for the keys and the sliders)
     for (size_t i = 0; i < n; i++) labels[i] = T(k_actions[i].en, k_actions[i].pt);
-    labels[n] = sl[0], labels[n + 1] = sl[1];
-    float x = ui_label_x(labels, (int)n + 2);
+    labels[n] = sl[0], labels[n + 1] = sl[1], labels[n + 2] = sl[2];
+    float x = ui_label_x(labels, (int)n + 3);
     ui_heading(T("Keyboard", "Teclado"));
     for (size_t k = 0; k < n; k++) {
         size_t i = k < n / 2 ? k * 2 : (k - n / 2) * 2 + 1;  // (in pairs in the table: the moves, then the buttons)
@@ -117,9 +118,22 @@ static void keys_section(void) {
     }
     ui_heading(T("Mouse and controller", "Mouse e controle"));
     ImGui::PushTextWrapPos(0);
-    ImGui::TextDisabled("%s", T("The right stick moves the camera (numpad 8 / 4 / 5 / 6 on the keyboard).",
-                                "O analógico direito move a câmera (8 / 4 / 5 / 6 do teclado numérico)."));
+    ImGui::TextDisabled("%s", T("The right stick moves the camera (numpad 8 / 4 / 5 / 6 on the keyboard). The mouse: drag "
+                                "with the right button to turn the camera (a quick right click is B), left click A, middle "
+                                "button X (menu), wheel up / down in menus and lists, side buttons L / R.",
+                                "O analógico direito move a câmera (8 / 4 / 5 / 6 do teclado numérico). O mouse: arraste com o "
+                                "botão direito para girar a câmera (um clique rápido no direito é B), clique esquerdo A, botão "
+                                "do meio X (menu), roda sobe / desce nos menus e listas, botões laterais L / R."));
     ImGui::PopTextWrapPos();
+    {
+        const char *mc[] = {T("Off", "Desligada"), T("Holding the right button", "Segurando o botão direito"),
+                            T("Always (the window holds the mouse)", "Sempre (o mouse fica preso na janela)")};
+        int v = g_settings.mouse_cam < 0 || g_settings.mouse_cam > 2 ? 2 : g_settings.mouse_cam;
+        ui_row(sl[2], x);
+        if (ui_combo("##mousecam", &v, mc, 3)) g_settings.mouse_cam = v;
+        ui_tip(T("Always: click into the game to hold the mouse; F12, Esc or Alt+Tab let it go.",
+                 "Sempre: clique no jogo para prender o mouse; F12, Esc ou Alt+Tab soltam."));
+    }
     ui_row(sl[0], x);
     ui_slider("##mouse", &g_settings.mouse_sens, 0.02f, 0.30f, "%.2f", 0.01f);
     ui_row(sl[1], x);

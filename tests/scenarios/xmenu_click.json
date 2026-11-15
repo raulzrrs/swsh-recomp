@@ -1,0 +1,3 @@
+{"description": "The X menu opened; a mouse click on BAG (layout 960, 244: two buttons right of the cursor) opens the bag; then a click on its 6th item (Energy Root, layout 1125, 686) walks the list there and opens the item's menu",
+ "save": "build/scenario-saves/user-shield-2", "input": "600:A:8,800:A:8,950:X:8", "exit_at": 1500, "measure": [1000, 1490], "shots": [1350, 1480],
+ "env": {"LARECOMP_UI_CLICK": "2200:960,244;2760:1125,686"}}

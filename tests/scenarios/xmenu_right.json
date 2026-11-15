@@ -1,0 +1,2 @@
+{"description": "The X menu opened, then Right once (mouse menu research: what marks the selected button)",
+ "save": "build/scenario-saves/user-shield-2", "input": "600:A:8,800:A:8,950:X:8,1100:RIGHT:4", "exit_at": 1250, "measure": [1000, 1240], "shots": [1080, 1200]}
