@@ -1,6 +1,7 @@
 // The look and the settings pages shared by the start screen and the F12 menu (runtime/ui/settings_ui.h). From Let's Go
 // Recomp 0.6.0, in Sword's colours, with the pages cut to what this port has.
 #define IMGUI_DEFINE_MATH_OPERATORS
+#include "../nvn/vulkan/dlss.h"  // (dlss_available: the DLAA choice)
 #include <SDL3/SDL.h>
 #include <math.h>
 #include <stdio.h>
@@ -534,12 +535,23 @@ void ui_page_graphics(float x, bool known) {
     }
     ui_group_gap();
     {
-        const char *aa[] = {UI_T("Off", "Desligado", "Выкл."), "SMAA"};
-        int v = g_settings.antialias == AA_SMAA ? 1 : 0;
+        // (DLAA only where NGX came up at start: an NVIDIA RTX driver and nvngx_dlss.dll next to the executable)
+        bool dl = dlss_available();
+        const char *aa[] = {UI_T("Off", "Desligado", "Выкл."), "SMAA", "TAA", "DLAA (NVIDIA)"};
+        static const int mode[] = {AA_OFF, AA_SMAA, AA_TAA, AA_DLAA};
+        int v = 0;
+        for (int i = 0; i < 4; i++) if (mode[i] == g_settings.antialias) v = i;
+        if (v == 3 && !dl) v = 2;  // (DLAA chosen, not available here: TAA runs)
         ui_row(l[1], x);
-        if (ui_combo("##aa", &v, aa, 2)) g_settings.antialias = v ? AA_SMAA : AA_OFF;
-        ui_tip(UI_T("Smooths jagged edges (SMAA, on the final image).", "Suaviza os serrilhados (SMAA, na imagem final).",
-                    "Сглаживает зубчатые края (SMAA, на итоговом кадре)."));
+        if (ui_combo("##aa", &v, aa, dl ? 4 : 3)) g_settings.antialias = mode[v];
+        ui_tip(UI_T("Smooths jagged edges. SMAA: on the final image, light. TAA: blends the last frames along the camera's "
+                    "motion (the cleanest edges; foliage and thin lines stop shimmering). DLAA: NVIDIA's AI in TAA's place, "
+                    "the best (RTX cards).",
+                    "Suaviza os serrilhados. SMAA: na imagem final, leve. TAA: junta os últimos quadros seguindo o movimento "
+                    "da câmera (bordas bem mais limpas; folhagem e linhas finas param de cintilar). DLAA: a IA da NVIDIA no "
+                    "lugar do TAA, o melhor (placas RTX).",
+                    "Сглаживает зубчатые края. SMAA: на итоговом кадре. TAA: смешивает последние кадры по движению камеры. "
+                    "DLAA: ИИ NVIDIA вместо TAA (карты RTX)."));
     }
     {   // (runtime/nvn/vulkan/textures.c: read once, the samplers are kept)
         const char *af[] = {UI_T("The game's", "Do jogo", "Как в игре"), "2x", "4x", "8x", "16x"};

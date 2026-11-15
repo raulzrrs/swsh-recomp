@@ -17,6 +17,7 @@
 #include "vk.h"
 #include "../renderer.h"
 #include "../../settings.h"
+#include "dlss.h"
 
 static uint64_t g_draws_total;  // (never reset: LARECOMP_COUNTER_LOG)
 static void watch_tex(NvnTexture *t, const char *what, const NvnTexture *from);  // (LARECOMP_WATCH_TEX, below)
@@ -1418,6 +1419,30 @@ static struct {
     uint32_t poff;
 } ao = {.pbind = -1};
 
+// TAA / DLAA (taa_run): the scene's passes are jittered by a sub-pixel offset each frame (through their viewport: the
+// whole image moves, no shader variant), and the HDR scene, complete (opaque, SSAO, blended), is resolved against its
+// history along the camera's motion vectors before the first pass on another colour target (the bloom).
+static struct {
+    double vp[16], vp_prev[16];   // the camera's view-projection (row-major), this frame's and the previous frame's
+    uint64_t cam_frame;           // the frame vp is of
+    bool prev_ok, cam_warned;     // vp_prev is the frame just before
+    uint64_t scene_d, scene_c;    // the scene's depth and colour (addresses, kept from frame to frame): jittered
+    bool jit_pass, pending;       // this pass's draws are jittered; resolve before this pass's first draw
+    float jx, jy;                 // this frame's jitter in pixels (the content moves right, down)
+    uint64_t jit_frame, jit_used; // the frame jx, jy are of; the last frame a draw took them
+    uint64_t done_frame, ok_frame;// resolve tried this frame; the last frame resolved (no resolve: no jitter either)
+    uint64_t hist_frame;          // the history's frame, size, viewport and kind (TAA / DLAA): kept only if all match
+    uint32_t hist_w, hist_h;
+    float hist_vp[4];
+    int hist_mode;
+} taa;
+static bool taa_wanted(void) { return g_settings.antialias == AA_TAA || g_settings.antialias == AA_DLAA; }
+static float halton(uint32_t i, uint32_t b) {
+    float f = 1, r = 0;
+    for (; i; i /= b) f /= (float)b, r += f * (float)(i % b);
+    return r;
+}
+
 // ================================================================== render passes
 static VkFormat pass_color[8], pass_depth, pass_stencil;
 static uint32_t pass_ncolor, pass_samples = 1, pass_w, pass_h;
@@ -1444,6 +1469,26 @@ static void vk_end_pass_at(int line) {
 }
 
 static uint32_t level_extent(uint32_t v, uint32_t lv) { v >>= lv; return v ? v : 1; }
+
+
+// begin_pass, TAA on: whether this pass's draws are jittered, whether the scene is resolved before it
+static void taa_pass_check(bool has_d) {
+    uint64_t fr = vk_frame_counter();
+    if (taa.jit_frame != fr) {  // (Halton 2, 3 over 8 frames)
+        taa.jit_frame = fr;
+        uint32_t i = (uint32_t)(fr % 8) + 1;
+        taa.jx = halton(i, 2) - 0.5f, taa.jy = halton(i, 3) - 0.5f;
+    }
+    uint64_t da = has_d && st.rt.depth ? st.rt.depth->addr : 0;
+    uint64_t ca = pass_ncolor && st.rt.color[0] ? st.rt.color[0]->addr : 0;
+    // the scene's passes (its depth: the depth-only pass first; its colour with a depth: the blended draws on their own
+    // depth), until the resolve - and only while it keeps resolving (else the image would shake)
+    if (taa.done_frame != fr && taa.ok_frame + 2 >= fr && taa.ok_frame && pass_samples == 1 &&
+        ((da && da == taa.scene_d) || (da && ca && ca == taa.scene_c)))
+        taa.jit_pass = true, taa.jit_used = fr;
+    // after the scene's effects ran (the SSAO's place: ao.done_frame), the first pass on another colour target
+    if (ao.dtex && ao.ctex && ao.done_frame == fr && taa.done_frame != fr && ca && ca != ao.ctex->addr) taa.pending = true;
+}
 
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
@@ -1564,7 +1609,8 @@ static void begin_pass(void) {
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     stat_passes++;
     ao.qual = ao.pending = false;
-    if (g_settings.ssao && !ao.busy) {
+    taa.pending = taa.jit_pass = false;
+    if ((g_settings.ssao || taa_wanted()) && !ao.busy) {
         uint64_t fr = vk_frame_counter();
         if (ao.frame != fr) { ao.frame = fr; ao.opaque = 0; ao.dtex = ao.ctex = NULL; }
         TexBackend *c0 = pass_ncolor && ca[0].imageView && st.rt.color[0] ? st.rt.color[0]->backend : NULL;
@@ -1582,7 +1628,9 @@ static void begin_pass(void) {
         } else if (ao.dtex && ao.opaque >= 16 && ao.done_frame != fr) {
             ao.pending = true;
         }
+        if (ao.dtex && ao.ctex) taa.scene_d = ao.dtex->addr, taa.scene_c = ao.ctex->addr;
     }
+    if (taa_wanted() && !ao.busy) taa_pass_check(has_d);
 }
 
 static void pass_size(int *w, int *h) {
@@ -1632,10 +1680,11 @@ static void set_viewport(float x, float y, float w, float h, float zn, float zf,
     if (h == 0) h = 1;
     VkViewport vp = neg_y ? (VkViewport){x, y, w, h, fminf(fmaxf(zn, 0), 1), fminf(fmaxf(zf, 0), 1)}
                           : (VkViewport){x, y + h, w, -h, fminf(fmaxf(zn, 0), 1), fminf(fmaxf(zf, 0), 1)};
-    vkCmdSetViewport(vk_cmd(), 0, 1, &vp);
     if (ao.qual) {  // (the SSAO rebuilds positions within the scene's viewport)
         ao.vp[0] = vp.x, ao.vp[1] = vp.height < 0 ? vp.y + vp.height : vp.y, ao.vp[2] = vp.width, ao.vp[3] = fabsf(vp.height);
     }
+    if (taa.jit_pass) vp.x += taa.jx, vp.y += taa.jy;  // (TAA: the content moves by the jitter, in this pass's pixels)
+    vkCmdSetViewport(vk_cmd(), 0, 1, &vp);
 }
 
 // ================================================================== clears
@@ -4277,6 +4326,7 @@ static void pf_rest_of_list(void) {
 }
 
 static uint64_t prof_tp_;
+static void taa_capture_camera(const float *p, uint32_t off, uint64_t size);
 // ================================================================== SSAO (Let's Go Recomp's, non-temporal)
 // A GL-style perspective matrix at m (row-major: the rows of P; column-major: its columns): P00, |P11|, A, B.
 static bool ssao_proj_at(const float *m, float out[4]) {
@@ -4313,6 +4363,7 @@ static void ssao_find_projection(void) {
             !ssao_cam_at_origin((const float *)(blk + ao.poff), ao.poff)) {
             memcpy(ao.proj, proj, sizeof ao.proj);
             ao.proj_frame = fr;
+            taa_capture_camera((const float *)(blk + ao.poff), ao.poff, u.size);
             return;
         }
     }
@@ -4329,6 +4380,7 @@ static void ssao_find_projection(void) {
                         proj[3] / (proj[2] + 1), proj[0], proj[1]);
                 memcpy(ao.proj, proj, sizeof ao.proj);
                 ao.pbind = b, ao.poff = o, ao.proj_frame = fr;
+                taa_capture_camera((const float *)(uintptr_t)(u.addr + o), o, u.size);
                 return;
             }
     }
@@ -4343,12 +4395,12 @@ static VkPipeline ssao_pipe(const char *fs, VkFormat fmt, int blend) {
     static struct { const char *fs; VkFormat fmt; int blend; VkPipeline p; } cache[16];
     for (int i = 0; i < 16; i++) if (cache[i].p && cache[i].fs == fs && cache[i].fmt == fmt && cache[i].blend == blend) return cache[i].p;
     if (!ssao_layout) {
-        VkDescriptorSetLayoutBinding b[2];
-        for (uint32_t i = 0; i < 2; i++)
+        VkDescriptorSetLayoutBinding b[4];
+        for (uint32_t i = 0; i < 4; i++)
             b[i] = (VkDescriptorSetLayoutBinding){i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
-        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = b};
+        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 4, .pBindings = b};
         VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &ssao_set_layout));
-        VkPushConstantRange r = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64};
+        VkPushConstantRange r = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128};
         VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
                                          .pSetLayouts = &ssao_set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &r};
         VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &ssao_layout));
@@ -4389,11 +4441,13 @@ static VkPipeline ssao_pipe(const char *fs, VkFormat fmt, int blend) {
     return p;
 }
 
-// SSAO image i (0, 1: the occlusion and the blur's ping-pong; 2: a dump) at w x h, RGBA8, kept until the size changes
-static TexBackend *ssao_image(int i, uint32_t w, uint32_t h) {
-    static TexBackend img[3];
+// The effects' image i at w x h in format f, kept until the size or the format changes. 0, 1: the SSAO's occlusion and
+// its blur's ping-pong; 2: a dump; 3: TAA's motion vectors (RGBA16F); 4, 5: TAA's history (RGBA16F); 6: the depth as
+// R32F (DLSS); 7: DLSS's output (RGBA16F)
+static TexBackend *fx_image(int i, uint32_t w, uint32_t h, VkFormat f) {
+    static TexBackend img[8];
     TexBackend *d = &img[i];
-    if (d->image && (d->width != w || d->height != h)) {
+    if (d->image && (d->width != w || d->height != h || d->format != f)) {
         vk_views_forget(d);
         vk_defer_image(d->image, d->mem);
         d->image = VK_NULL_HANDLE;
@@ -4401,17 +4455,20 @@ static TexBackend *ssao_image(int i, uint32_t w, uint32_t h) {
     }
     if (!d->image) {
         VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
-                                .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
+                                .format = f, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
                                 .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
-                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                         (f == VK_FORMAT_R16G16B16A16_SFLOAT ? VK_IMAGE_USAGE_STORAGE_BIT : 0)};  // (DLSS writes it)
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL));
-        d->format = VK_FORMAT_R8G8B8A8_UNORM; d->width = w; d->height = h; d->depth = 1; d->layers = 1; d->levels = 1;
+        d->format = f; d->width = w; d->height = h; d->depth = 1; d->layers = 1; d->levels = 1;
         d->samples = 1; d->aspect = VK_IMAGE_ASPECT_COLOR_BIT; d->base_type = VK_IMAGE_VIEW_TYPE_2D;
         vk_image_init_layout(vk_cmd(), d->image, d->aspect);
     }
     return d;
 }
+
+#define ssao_image(i, w, h) fx_image(i, w, h, VK_FORMAT_R8G8B8A8_UNORM)
 
 static VkImageView ssao_view(TexBackend *d) {
     static const VkComponentMapping id = {0};
@@ -4420,7 +4477,7 @@ static VkImageView ssao_view(TexBackend *d) {
 
 // One SSAO pass (outside any rendering): srcs -> the view dv (dw x dh); load: keep its contents (the apply's blending)
 static void ssao_pass(VkCommandBuffer cb, VkPipeline pipe, const VkImageView *srcs, int n, VkImageView dv, uint32_t dw, uint32_t dh,
-                      const float pc[16], bool load) {
+                      const float *pc, uint32_t pcsize, unsigned linear, bool load) {
     vk_full_barrier(cb);
     VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = dv,
                                     .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
@@ -4430,22 +4487,22 @@ static void ssao_pass(VkCommandBuffer cb, VkPipeline pipe, const VkImageView *sr
                           .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &ca};
     vkCmdBeginRendering(cb, &ri);
     VkDescriptorSet ds = vk_alloc_set(ssao_set_layout);
-    VkDescriptorImageInfo ii[2];
-    VkWriteDescriptorSet w[2];
-    for (int i = 0; i < 2; i++) {  // (both bindings written: an unused one gets the first input)
-        ii[i] = (VkDescriptorImageInfo){vk_default_sampler(false), srcs[i < n ? i : 0], VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo ii[4];
+    VkWriteDescriptorSet w[4];
+    for (int i = 0; i < 4; i++) {  // (all bindings written: an unused one gets the first input; linear: bit i, filtered)
+        ii[i] = (VkDescriptorImageInfo){vk_default_sampler(i < n && (linear >> i & 1)), srcs[i < n ? i : 0], VK_IMAGE_LAYOUT_GENERAL};
         w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = (uint32_t)i,
                                       .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                       .pImageInfo = &ii[i]};
     }
-    vkUpdateDescriptorSets(g_vk.dev, 2, w, 0, NULL);
+    vkUpdateDescriptorSets(g_vk.dev, 4, w, 0, NULL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, ssao_layout, 0, 1, &ds, 0, NULL);
     VkViewport vp = {0, 0, (float)dw, (float)dh, 0, 1};
     VkRect2D sc = {{0, 0}, {dw, dh}};
     vkCmdSetViewport(cb, 0, 1, &vp);
     vkCmdSetScissor(cb, 0, 1, &sc);
-    vkCmdPushConstants(cb, ssao_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64, pc);
+    vkCmdPushConstants(cb, ssao_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, pcsize, pc);
     vkCmdDraw(cb, 3, 1, 0, 0);
     vkCmdEndRendering(cb);
     vk_full_barrier(cb);
@@ -4486,13 +4543,13 @@ static void ssao_run(void) {
     if (vw < 16 || vh < 16) vx = vy = 0, vw = (float)w, vh = (float)h;
     float pc[16] = {ao.proj[0], ao.proj[1], ao.proj[2], ao.proj[3], radius, g_settings.ssao_intensity * kint, mo,
                     0.08f * vh, 0, (float)g_settings.ssao_samples, 0, 0, vx, vy, vw, vh};
-    ssao_pass(cb, p_ao, &dv, 1, ssao_view(a0), w, h, pc, false);
+    ssao_pass(cb, p_ao, &dv, 1, ssao_view(a0), w, h, pc, 64, 0, false);
     float pb[16] = {ao.proj[0], ao.proj[1], ao.proj[2], ao.proj[3], 1, 0, mo, 0, 0, 0, 0, 0, vx, vy, vw, vh};
     VkImageView bx[2] = {ssao_view(a0), dv};
-    ssao_pass(cb, p_blur, bx, 2, ssao_view(a1), w, h, pb, false);
+    ssao_pass(cb, p_blur, bx, 2, ssao_view(a1), w, h, pb, 64, 0, false);
     pb[4] = 0, pb[5] = 1;
     VkImageView by[2] = {ssao_view(a1), dv};
-    ssao_pass(cb, p_blur, by, 2, ssao_view(a0), w, h, pb, false);
+    ssao_pass(cb, p_blur, by, 2, ssao_view(a0), w, h, pb, 64, 0, false);
     VkImageView ai[1] = {ssao_view(a0)};
     // LARECOMP_SSAO_DUMP=<frame>,...: the occlusion as applied -> build/frames/ao_<frame>.png
     static const char *dump = (const char *)1;
@@ -4509,7 +4566,7 @@ static void ssao_run(void) {
     }
     {
         float pa[16] = {0, 0, 0, 0, 1.0f / (float)ao.cw, 1.0f / (float)ao.ch, 0, 0};
-        ssao_pass(cb, p_apply, ai, 1, ao.cview, ao.cw, ao.ch, pa, true);
+        ssao_pass(cb, p_apply, ai, 1, ao.cview, ao.cw, ao.ch, pa, 64, 0, true);
     }
     static bool logged;
     if (!logged) {
@@ -4517,6 +4574,222 @@ static void ssao_run(void) {
         LOG("[ssao] scene %ux%u (format %d), depth %ux%u (format %d), viewport %.0f,%.0f %.0fx%.0f, %u opaque draws before it; "
             "radius %.1f intensity %.2f samples %d\n", ao.cw, ao.ch, (int)ao.cfmt, w, h, (int)d->format, vx, vy, vw, vh, ao.opaque, radius,
             g_settings.ssao_intensity * kint, g_settings.ssao_samples);
+    }
+    ao.busy = false;
+}
+
+
+// ================================================================== TAA / DLAA
+static bool mat4_inv(const double *m, double *o) {  // (row-major 4x4, Gauss-Jordan with pivoting)
+    double a[4][8];
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 8; c++) a[r][c] = c < 4 ? m[r * 4 + c] : (c - 4 == r);
+    for (int c = 0; c < 4; c++) {
+        int pv = c;
+        for (int r = c + 1; r < 4; r++) if (fabs(a[r][c]) > fabs(a[pv][c])) pv = r;
+        if (fabs(a[pv][c]) < 1e-20) return false;
+        if (pv != c) for (int k = 0; k < 8; k++) { double t = a[c][k]; a[c][k] = a[pv][k]; a[pv][k] = t; }
+        double d = a[c][c];
+        for (int k = 0; k < 8; k++) a[c][k] /= d;
+        for (int r = 0; r < 4; r++)
+            if (r != c && a[r][c] != 0) {
+                double f = a[r][c];
+                for (int k = 0; k < 8; k++) a[r][k] -= f * a[c][k];
+            }
+    }
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) o[r * 4 + c] = a[r][c + 4];
+    return true;
+}
+
+// Matrix at m (16 floats; rows: row-major, else column-major) as row-major doubles
+static void taa_mat_at(const float *m, bool rows, double o[16]) {
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) o[r * 4 + c] = rows ? m[r * 4 + c] : m[c * 4 + r];
+}
+static bool taa_rigid(const double *V) {
+    if (V[12] != 0 || V[13] != 0 || V[14] != 0 || V[15] != 1) return false;
+    for (int r = 0; r < 3; r++)
+        if (fabs(V[r * 4] * V[r * 4] + V[r * 4 + 1] * V[r * 4 + 1] + V[r * 4 + 2] * V[r * 4 + 2] - 1) > 1e-3) return false;
+    return true;
+}
+static void taa_mul(const double *a, const double *b, double *o) {
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
+            double sum = 0;
+            for (int k = 0; k < 4; k++) sum += a[r * 4 + k] * b[k * 4 + c];
+            o[r * 4 + c] = sum;
+        }
+}
+static bool taa_close(const double *a, const double *b) {
+    for (int i = 0; i < 16; i++)
+        if (fabs(a[i] - b[i]) > 1e-3 * fmax(1.0, fabs(a[i]))) return false;
+    return true;
+}
+
+// The camera of this frame, from the projection found at p (byte off of its constant buffer, size bytes): the view
+// matrix V of the same block - a rigid transform whose P x V the block holds too (its view-projection: Sword keeps it
+// at the block's start, the view 464 bytes before the projection and the camera's own matrix, also rigid, elsewhere;
+// Let's Go keeps view, projection, view-projection in a row). Found by a scan of the block once, then checked each
+// frame where it was. vp = P x V.
+static void taa_capture_camera(const float *p, uint32_t off, uint64_t size) {
+    uint64_t fr = vk_frame_counter();
+    if (!taa_wanted() || taa.cam_frame == fr) return;
+    static int64_t voff = -1, vpoff = -1;  // (relative to the projection, bytes)
+    bool row = p[14] == -1;  // (ssao_proj_at's two forms: rows, or columns)
+    const float *b0 = p - off / 4;
+    uint64_t n = size > 4096 ? 4096 : size;
+    double P[16], V[16], vp[16], M[16];
+    taa_mat_at(p, row, P);
+    bool ok = false;
+    if (voff != -1 && (int64_t)off + voff >= 0 && (uint64_t)((int64_t)off + voff) + 64 <= n) {  // (where it was)
+        taa_mat_at(p + voff / 4, row, V);
+        ok = taa_rigid(V);
+    }
+    if (!ok) {
+        for (uint64_t o = 0; o + 64 <= n && !ok; o += 16) {
+            if (o == off) continue;
+            taa_mat_at(b0 + o / 4, row, V);
+            if (!taa_rigid(V) || fabs(V[3]) + fabs(V[7]) + fabs(V[11]) < 1) continue;  // (a camera that does not move: none)
+            taa_mul(P, V, vp);
+            for (uint64_t q = 0; q + 64 <= n; q += 16) {
+                taa_mat_at(b0 + q / 4, row, M);
+                if (taa_close(vp, M)) { ok = true, voff = (int64_t)o - off, vpoff = (int64_t)q - off; break; }
+            }
+        }
+        static int64_t said = -2;
+        if (ok && said != voff)
+            said = voff, LOG("[taa] camera: view at %+lld bytes from the projection, view-projection at %+lld (%s)\n",
+                             (long long)voff, (long long)vpoff, row ? "rows" : "columns");
+    }
+    if (!ok) {
+        if (!taa.cam_warned) {
+            taa.cam_warned = true;
+            LOG("[taa] no view matrix found by the projection (at %u, %s): no motion vectors\n", off, row ? "rows" : "columns");
+            if (getenv("LARECOMP_CAM_PROBE"))  // (research: the camera block's words, 16 bytes a line)
+                for (uint64_t o = 0; o + 16 <= n && o < off + 256; o += 16)
+                    LOG("[taa]   +%4llu: %12.5g %12.5g %12.5g %12.5g\n", (unsigned long long)o, b0[o / 4], b0[o / 4 + 1], b0[o / 4 + 2],
+                        b0[o / 4 + 3]);
+        }
+        return;
+    }
+    taa_mul(P, V, vp);
+    taa.prev_ok = taa.cam_frame && taa.cam_frame + 1 == fr;
+    memcpy(taa.vp_prev, taa.vp, sizeof vp);
+    memcpy(taa.vp, vp, sizeof vp);
+    taa.cam_frame = fr;
+}
+
+static float taa_env(const char *name, float def) {
+    const char *e = getenv(name);
+    return e && *e ? (float)atof(e) : def;
+}
+
+// Resolve this frame's scene (outside any pass): its camera motion vectors (from the depth and the two frames'
+// view-projections), then DLAA (NVIDIA, when chosen and up) or TAA against the history, back into the scene's colour.
+static void taa_run(void) {
+    uint64_t fr = vk_frame_counter();
+    taa.done_frame = fr;
+    TexBackend *d = ao.dtex ? ao.dtex->backend : NULL;
+    TexBackend *cb_ = ao.ctex ? ao.ctex->backend : NULL;
+    static int nolog;
+    if (!d || !d->image || !(d->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || d->samples > 1 || !cb_ || !cb_->image || !ao.cview) return;
+    if (taa.cam_frame != fr || ao.proj_frame != fr) {
+        if (nolog < 5) nolog++, LOG("[taa] frame %llu: no camera found in the scene's %u opaque draws: not resolved\n",
+                                    (unsigned long long)fr, ao.opaque);
+        return;
+    }
+    uint32_t w = d->width, h = d->height;
+    if (w != ao.cw || h != ao.ch) {
+        if (nolog < 5) nolog++, LOG("[taa] depth %ux%u and scene %ux%u differ: not resolved\n", w, h, ao.cw, ao.ch);
+        return;
+    }
+    ao.busy = true;
+    VkCommandBuffer cb = vk_cmd();
+    if (g_gpuprof_frame) gp_mark(cb, "ours: TAA");
+    static const VkComponentMapping id = {0};
+    VkImageView dv = vk_image_view(d, VK_IMAGE_VIEW_TYPE_2D, d->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT);
+    float mo = nvn_depth_mode() == 0 ? 1.0f : 0.0f;
+    float vx = ao.vp[0], vy = ao.vp[1], vw = ao.vp[2], vh = ao.vp[3];
+    if (vw < 16 || vh < 16) vx = vy = 0, vw = (float)w, vh = (float)h;
+    // the motion vectors: previous view-projection x the inverse of this one (identity without a previous frame)
+    double m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}, inv[16];
+    bool moved = taa.prev_ok && mat4_inv(taa.vp, inv);
+    if (moved)
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++) {
+                double sum = 0;
+                for (int k = 0; k < 4; k++) sum += taa.vp_prev[r * 4 + k] * inv[k * 4 + c];
+                m[r * 4 + c] = sum;
+            }
+    static float ysign;
+    if (!ysign) ysign = taa_env("LARECOMP_MV_YSIGN", 1);
+    float pm[32] = {0};
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) pm[c * 4 + r] = (float)m[r * 4 + c];  // (GLSL mat4: columns)
+    pm[16] = mo, pm[17] = ysign, pm[20] = vx, pm[21] = vy, pm[22] = vw, pm[23] = vh;
+    const VkFormat F16 = VK_FORMAT_R16G16B16A16_SFLOAT;
+    TexBackend *mv = fx_image(3, w, h, F16);
+    ssao_pass(cb, ssao_pipe("taa_mv.frag", F16, 0), &dv, 1, ssao_view(mv), w, h, pm, 96, 0, false);
+    bool full = vx == 0 && vy == 0 && (uint32_t)vw == w && (uint32_t)vh == h;
+    // DLAA: the scene's rectangle from the top-left (all of the target, or Sword's dynamic resolution's part of it)
+    bool corner = vx == 0 && vy == 0 && vw == floorf(vw) && vh == floorf(vh);
+    (void)full;
+    int mode = g_settings.antialias == AA_DLAA && dlss_available() && corner ? 2 : 1;
+    static uint64_t taa_prev_frame;
+    static int taa_prev_mode;
+    bool reset = !moved || taa.hist_frame + 1 != fr || taa.hist_w != w || taa.hist_h != h || taa.hist_mode != mode ||
+                 memcmp(taa.hist_vp, (float[4]){vx, vy, vw, vh}, sizeof taa.hist_vp) != 0;
+    float jx = taa.jit_used == fr ? taa.jx : 0, jy = taa.jit_used == fr ? taa.jy : 0;
+    static float sharp_k = -1;
+    if (sharp_k < 0) sharp_k = taa_env("LARECOMP_TAA_SHARPEN", 1.0f);
+    TexBackend *res = NULL;
+    if (mode == 2) {  // DLAA: the scene's own image, the depth as R32F, the vectors in pixels (previous - current)
+        uint32_t rw = (uint32_t)vw, rh = (uint32_t)vh;
+        TexBackend *dz = fx_image(6, w, h, VK_FORMAT_R32_SFLOAT), *out = fx_image(7, rw, rh, F16);
+        float pz[16] = {0};
+        ssao_pass(cb, ssao_pipe("depth_r32.frag", VK_FORMAT_R32_SFLOAT, 0), &dv, 1, ssao_view(dz), w, h, pz, 64, 0, false);
+        DlssInput in = {.color = cb_->image, .depth = dz->image, .mv = mv->image, .output = out->image, .color_fmt = cb_->format,
+                        .rw = rw, .rh = rh, .ow = rw, .oh = rh, .iw = w, .ih = h, .jx = jx, .jy = jy,
+                        .mv_scale_x = -(float)w, .mv_scale_y = -(float)h,
+                        .reset = reset};
+        if (dlss_dispatch(cb, &in)) res = out;
+        else mode = 1;  // (DLSS failed: TAA from now on)
+        cb = vk_cmd();
+    }
+    if (mode == 1) {  // TAA: this frame against the history (ping-pong 4 / 5), the history by Catmull-Rom (linear)
+        TexBackend *hc = fx_image(4 + (int)(fr & 1), w, h, F16), *hp = fx_image(4 + (int)((fr + 1) & 1), w, h, F16);
+        static float weight = -1;
+        if (weight < 0) weight = taa_env("LARECOMP_TAA_HISTORY", 0.9f);
+        float pt[16] = {ao.proj[0], ao.proj[1], ao.proj[2], ao.proj[3], reset ? 1.0f : 0.0f, weight, mo, 0,
+                        vx / (float)w, vy / (float)h, (vx + vw) / (float)w, (vy + vh) / (float)h};
+        VkImageView src[4] = {ao.cview, ssao_view(hp), ssao_view(mv), dv};
+        ssao_pass(cb, ssao_pipe("taa.frag", F16, 0), src, 4, ssao_view(hc), w, h, pt, 64, 2, false);
+        res = hc;
+    }
+    // back into the scene, sharpened (TAA_SHARPNESS: the history's blur; DLAA sharpens nothing itself)
+    float pk[8] = {0, 0, 0, 0, 1.0f / (float)w, 1.0f / (float)h, g_settings.taa_sharpness * (mode == 2 ? 0.5f : 0.8f) * sharp_k, 0};
+    VkImageView ri[1] = {ssao_view(res)};
+    ssao_pass(cb, ssao_pipe("taa_copy.frag", ao.cfmt, 0), ri, 1, ao.cview, w, h, pk, 32, 0, false);
+    taa.hist_frame = fr, taa.hist_w = w, taa.hist_h = h, taa.hist_mode = mode;
+    taa.hist_vp[0] = vx, taa.hist_vp[1] = vy, taa.hist_vp[2] = vw, taa.hist_vp[3] = vh;
+    taa.ok_frame = fr;
+    static int logged_mode;
+    if (logged_mode != mode) {
+        logged_mode = mode;
+        LOG("[taa] %s: scene %ux%u (format %d), viewport %.0f,%.0f %.0fx%.0f, history %s, jitter %.3f %.3f px, %u opaque draws\n",
+            mode == 2 ? "DLAA" : "TAA", w, h, (int)cb_->format, vx, vy, vw, vh, reset ? "reset" : "kept", jx, jy, ao.opaque);
+    }
+    {   // every 600 frames: how many were resolved, with their history, jittered (the reasons for a reset)
+        static uint32_t n, kept, jit, why[4];
+        n++, kept += !reset, jit += taa.jit_used == fr;
+        if (reset) why[0] += !moved, why[1] += taa_prev_frame + 1 != fr, why[2] += taa_prev_mode != mode;
+        taa_prev_frame = fr, taa_prev_mode = mode;
+        if (n >= 600) {
+            LOG("[taa] %u frames resolved: history kept %u, jittered %u; resets: no previous camera %u, a frame skipped %u, "
+                "mode changed %u\n", n, kept, jit, why[0], why[1], why[2]);
+            n = kept = jit = 0, memset(why, 0, sizeof why);
+        }
     }
     ao.busy = false;
 }
@@ -4538,6 +4811,7 @@ static bool ssao_draw_hook(void) {
                 c ? (unsigned long long)c->addr : 0ull, st.rt.depth ? (unsigned long long)st.rt.depth->addr : 0ull,
                 (unsigned long long)ao.ctex->addr, (unsigned long long)ao.dtex->addr, ao.opaque, (unsigned long long)stat_draws);
         }
+        if (!g_settings.ssao) { ao.done_frame = fr; return false; }  // (TAA on alone: the scene's place only)
         vk_end_pass();
         ssao_run();
         return true;
@@ -4548,6 +4822,7 @@ static bool ssao_draw_hook(void) {
         return false;
     }
     if (st.ds[0] || ao.opaque < 16 || ao.done_frame == fr) return false;
+    if (!g_settings.ssao) { ao.done_frame = fr; return false; }
     if (nlog < 3) nlog++, LOG("[ssao] frame %llu: run before a draw without depth test in the scene, after %u opaque draws\n",
                               (unsigned long long)fr, ao.opaque);
     vk_end_pass();
@@ -4645,6 +4920,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if (st.rt.color[i] && ((st.channel_mask >> (i * 4)) & 0xF)) snapshots_invalidate(st.rt.color[i]);
     begin_pass();
     if ((ao.qual || ao.pending) && ssao_draw_hook()) begin_pass();
+    if (taa.pending) { taa.pending = false; vk_end_pass(); taa_run(); begin_pass(); }  // (TAA / DLAA: taa_run)
     VkCommandBuffer cb = vk_cmd();
 
     uint32_t mode = (uint32_t)r->x[0];
@@ -5562,7 +5838,11 @@ static void post_pass(VkCommandBuffer cb, const char *fs, const VkImageView *src
 // size in the window (its crop is drawn into the viewport).
 static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, double oh_d) {
     VkImageView v = raw_view(b);
-    bool smaa = g_settings.antialias == AA_SMAA;
+    // with TAA / DLAA too (LARECOMP_TAA_SMAA=0: not): the game's depth of field, after the resolve, cuts its blur along
+    // the depth, which is not anti-aliased - the far edges' stairs come back there; SMAA on the final image smooths them
+    static int taa_smaa = -1;
+    if (taa_smaa < 0) taa_smaa = getenv("LARECOMP_TAA_SMAA") ? atoi(getenv("LARECOMP_TAA_SMAA")) : 1;
+    bool smaa = g_settings.antialias == AA_SMAA || (taa_smaa && taa_wanted() && taa.ok_frame + 2 >= vk_frame_counter());
     uint32_t ow = (uint32_t)lround(ow_d), oh = (uint32_t)lround(oh_d);
     if (ow > 16384) ow = 16384;
     if (oh > 16384) oh = 16384;

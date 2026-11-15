@@ -44,6 +44,7 @@ Settings g_settings = {
     .gi_div = 2,
     .gi_temporal = true,
     .mouse_sens = 0.1f,
+    .mouse_cam = 2,  // (always: a PC game's mouse look)
     .stick_deadzone = 0.15f,
     .reverb = true,
     .movie_audio = true,
@@ -91,6 +92,7 @@ static void parse_line(const char *line) {
     else if (!strcmp(key, "ssao_debug")) g_settings.ssao_debug = atoi(val) != 0;  // (by hand / tests: never saved)
     else if (!strcmp(key, "mv_debug")) g_settings.mv_debug = atoi(val) != 0;      // (the same)
     else if (!strcmp(key, "mouse_sens")) g_settings.mouse_sens = (float)atof(val);
+    else if (!strcmp(key, "mouse_cam")) { int v = atoi(val); g_settings.mouse_cam = v < 0 || v > 2 ? 2 : v; }
     else if (!strcmp(key, "stick_deadzone")) g_settings.stick_deadzone = (float)atof(val);
     else if (!strcmp(key, "reverb")) g_settings.reverb = atoi(val) != 0;
     else if (!strcmp(key, "movie_audio")) g_settings.movie_audio = atoi(val) != 0;
@@ -113,7 +115,7 @@ static void parse_line(const char *line) {
     else if (!strcmp(key, "smaa")) g_settings.antialias = atoi(val) != 0 ? AA_SMAA : AA_OFF;
     // (after "smaa" in the file: the choice among the three; "smaa" stays for older versions)
     else if (!strcmp(key, "aa"))
-        g_settings.antialias = !strcmp(val, "fsr3") ? AA_FSR3 : !strcmp(val, "taa") ? AA_TAA : !strcmp(val, "smaa") ? AA_SMAA : AA_OFF;
+        g_settings.antialias = !strcmp(val, "dlaa") ? AA_DLAA : !strcmp(val, "fsr3") ? AA_FSR3 : !strcmp(val, "taa") ? AA_TAA : !strcmp(val, "smaa") ? AA_SMAA : AA_OFF;
     else if (!strcmp(key, "taa_sharpness")) g_settings.taa_sharpness = (float)atof(val);
     else if (!strcmp(key, "fsr3_sharpness")) g_settings.fsr3_sharpness = (float)atof(val);
     else if (!strcmp(key, "fsr3_preset"))
@@ -174,7 +176,8 @@ void settings_apply_levels(void) {
     if (g_settings.ssao_level == FX_ULTRA) g_settings.ssao_level = FX_HIGH;
     g_settings.gi_level = FX_OFF;
     g_settings.gi = g_settings.contact_on = false;
-    if (g_settings.antialias != AA_OFF && g_settings.antialias != AA_SMAA) g_settings.antialias = AA_SMAA;
+    // TAA and DLAA are ported (exec.c taa_run: camera motion vectors, the scene's draws jittered); FSR 3.1 is not
+    if (g_settings.antialias == AA_FSR3) g_settings.antialias = AA_TAA;
     g_settings.upscaler_pick = UPSCALE_FSR1;
     g_settings.upscaler = UPSCALE_FSR1;
     g_settings.frame_gen = 0;
@@ -225,7 +228,8 @@ void settings_save(void) {
     fprintf(f, "fps = %d\n", g_settings.fps);
     fprintf(f, "render_height = %d\n", g_settings.res_height);
     fprintf(f, "smaa = %d\n", g_settings.antialias != AA_OFF);
-    fprintf(f, "aa = %s\n", g_settings.antialias == AA_FSR3 ? "fsr3" : g_settings.antialias == AA_TAA ? "taa" :
+    fprintf(f, "aa = %s\n", g_settings.antialias == AA_DLAA ? "dlaa" : g_settings.antialias == AA_FSR3 ? "fsr3" :
+                            g_settings.antialias == AA_TAA ? "taa" :
                             g_settings.antialias == AA_SMAA ? "smaa" : "off");
     fprintf(f, "upscaler = fsr1\n");  // (SwSh Recomp: always FSR 1, settings_apply_levels; for older versions)
     fprintf(f, "taa_sharpness = %.2f\n", g_settings.taa_sharpness);
@@ -236,6 +240,7 @@ void settings_save(void) {
     else fprintf(f, "frame_gen = %d\n", g_settings.frame_gen);
     fprintf(f, "mod = %s\n", g_settings.mod);
     fprintf(f, "mouse_sens = %.3f\n", g_settings.mouse_sens);
+    fprintf(f, "mouse_cam = %d\n", g_settings.mouse_cam);
     fprintf(f, "stick_deadzone = %.2f\n", g_settings.stick_deadzone);
     fprintf(f, "volume = %.2f\n", g_settings.volume);
     fprintf(f, "brightness = %.2f\n", g_settings.brightness);

@@ -16,7 +16,7 @@ float settings_fsr3_ratio(void);  // 1.0, 1.5, 1.7, 2.0, 3.0
 // TAA: temporal, on the game's HDR scene before its bloom (runtime/nvn/vulkan/exec.c taa_run), jittered draws
 // FSR 3.1 is the fourth choice: it anti-aliases and upscales; with the others a lower internal resolution reaches the
 // window bilinearly (the upscaler follows: settings_apply_levels)
-enum { AA_OFF = 0, AA_SMAA = 1, AA_TAA = 2, AA_FSR3 = 3 };
+enum { AA_OFF = 0, AA_SMAA = 1, AA_TAA = 2, AA_FSR3 = 3, AA_DLAA = 4 /* NVIDIA DLAA at TAA's place (dlss.c), TAA without it */ };
 // SSAO and GI quality (F12 menu): their parameters follow (settings_apply_levels); HIGH = the former defaults
 enum { FX_OFF = 0, FX_LOW = 1, FX_MEDIUM = 2, FX_HIGH = 3, FX_ULTRA = 4 };  // (ultra: SSAO only - high plus light contact shadows)
 enum { VREAD_AUTO = 0, VREAD_COPY = 1, VREAD_DIRECT = 2 };
@@ -67,7 +67,8 @@ typedef struct {
     int gi_div;           // GI resolution: 2 half, 3 third, 4 quarter of each axis (default 2)
     bool gi_temporal;     // accumulated over frames along the camera motion vectors (default on)
     bool gi_debug;        // (not saved) the indirect light alone, shown at the present
-    float mouse_sens;    // mouse aim (the virtual gyro, runtime/hle/input.c): degrees per pixel
+    float mouse_sens;    // mouse: the camera's speed (runtime/hle/input.c mouse_camera; and the virtual gyro's, degrees per pixel)
+    int mouse_cam;       // the camera with the mouse: 0 never, 1 while the right button is held (default), 2 always
     float stick_deadzone;  // a controller's sticks: the share of their travel read as rest (runtime/hle/input.c)
     bool reverb;         // room reverb effect
     bool movie_audio;

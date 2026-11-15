@@ -604,7 +604,9 @@ static const char *builtin_src(const char *name, int *stage) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\nvoid main() {}\n";
     }
-    return NULL;
+    // the scene effects after the SSAO (TAA, DLSS's inputs): fx_shaders.c, outside this file's prepared-shader key
+    extern const char *fx_builtin_src(const char *name, int *stage);
+    return fx_builtin_src(name, stage);
 }
 
 VkShaderModule vk_builtin_shader(const char *name) {
