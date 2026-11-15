@@ -10,8 +10,8 @@ all of it holds 60 fps at 1440p and at 4K.
 - **Anti-aliasing: TAA and NVIDIA DLAA** (Graphics → Anti-aliasing: Off / SMAA / TAA / DLAA). The scene is jittered a
   fraction of a pixel each frame and resolved against the frames before it along the camera's motion, on the game's
   HDR image before its bloom: edges, fences, windows and foliage stop stair-stepping and shimmering. DLAA is NVIDIA's
-  model in TAA's place (RTX cards: it shows when the driver and `nvngx_dlss.dll` next to `lasrecomp.exe` are found);
-  without them DLAA runs as TAA. It follows the game's dynamic resolution (the scene in 80% of the image in some areas).
+  model in TAA's place (RTX cards; NVIDIA's `nvngx_dlss.dll` comes in the zip); without an RTX card and driver DLAA
+  runs as TAA. It follows the game's dynamic resolution (the scene in 80% of the image in some areas).
 - **Ambient occlusion** (Graphics → Ambient occlusion: Off / Low / Medium / High): soft contact shadows under the
   characters, at the foot of walls, in windows and in the grass (Let's Go Recomp's SSAO, fitted to Sword's scene).
 - **Sharper sun shadows**: the shadow map at 2x (default) or 4x (Graphics → Shadow resolution); shadows get a shape

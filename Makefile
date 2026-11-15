@@ -233,6 +233,9 @@ dist:
 	cp LICENSE "$(DIST)/LICENSE.txt"
 	cp LICENSE-LASRecomp "$(DIST)/LICENSE-LASRecomp.txt"
 	cp docs/release-README.txt "$(DIST)/README.txt"
+	# NVIDIA's DLSS model (DLAA: runtime/nvn/vulkan/dlss.c), redistributed as NVIDIA's DLSS SDK allows; not in git
+	# (58 MB): put nvngx_dlss.dll in build/dlss/ before `make dist`, or the release goes without it (TAA instead)
+	if [ -f build/dlss/nvngx_dlss.dll ]; then cp build/dlss/nvngx_dlss.dll "$(DIST)/"; else echo "(no build/dlss/nvngx_dlss.dll: DLAA left out)"; fi
 	PATH="$(CURDIR)/build/deps-win/bin:$$PATH" ldd $(WIN_B)/SwShRecomp.exe | awk '(/ucrt64/ || /deps-win/) && !/vulkan-1/ {print $$3}' | sort -u | \
 	    xargs -I{} cp -u {} "$(DIST)/"
 	! ls "$(DIST)" | grep -iE 'x264|x265|xvid|postproc'  # (no GPL codec libraries in the release)

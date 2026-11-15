@@ -37,8 +37,9 @@ Options (start screen, and F12 in the game): resolution, fullscreen, 30 / 60 fps
 DLAA), ambient occlusion, shadow resolution, brightness, contrast, saturation, volume, the controller layout (Nintendo /
 Xbox), the keys, the mouse, and mods (several at once). More in larecomp.ini.
 
-NVIDIA DLAA (RTX cards) needs NVIDIA's nvngx_dlss.dll next to SwShRecomp.exe (from NVIDIA's DLSS SDK,
-github.com/NVIDIA/DLSS, or another game that ships it); without it the DLAA choice is hidden and TAA does the job.
+NVIDIA DLAA (RTX cards) uses NVIDIA's DLSS model, nvngx_dlss.dll, included next to SwShRecomp.exe (NVIDIA DLSS,
+Copyright NVIDIA Corporation, redistributed under the NVIDIA DLSS SDK license: github.com/NVIDIA/DLSS). It needs a
+current NVIDIA driver; elsewhere the DLAA choice is hidden and TAA does the job.
 
 Everything stays in this folder: settings (larecomp.ini), saves (save-sword\ or save-shield\), the game files
 (extracted\), shader caches
