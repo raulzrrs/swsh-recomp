@@ -371,6 +371,33 @@ const char *romfs_file_at(uint64_t off) {
     return NULL;
 }
 
+// The last files read from the image, named in the log when the game stops on a file system error (fs_dump_recent,
+// from svcBreak): a mod's broken file is then in the log of the crash itself (issue #17), without LARECOMP_LOG_FILES.
+#define RECENT 8
+static struct { const char *path; bool mod; uint64_t bytes; } recent[RECENT];
+static int recent_n;
+static pthread_mutex_t recent_lock = PTHREAD_MUTEX_INITIALIZER;
+static void recent_note(const char *path, bool mod, uint64_t bytes) {
+    pthread_mutex_lock(&recent_lock);
+    int i = (recent_n - 1) & (RECENT - 1);
+    if (recent_n && recent[i].path == path) recent[i].bytes += bytes;
+    else { i = recent_n++ & (RECENT - 1); recent[i].path = path, recent[i].mod = mod, recent[i].bytes = bytes; }
+    pthread_mutex_unlock(&recent_lock);
+}
+void fs_dump_recent(void) {
+    pthread_mutex_lock(&recent_lock);
+    int n = recent_n < RECENT ? recent_n : RECENT;
+    LOG("[fs] the last %d files read (oldest first):\n", n);
+    for (int k = recent_n - n; k < recent_n; k++) {
+        int i = k & (RECENT - 1);
+        struct stat sb;
+        if (recent[i].mod && !stat(recent[i].path, &sb))
+            LOG("[fs]   (mod) %s: %llu bytes read, the file has %llu\n", recent[i].path, (unsigned long long)recent[i].bytes,
+                (unsigned long long)sb.st_size);
+        else LOG("[fs]   %s%s: %llu bytes read\n", recent[i].mod ? "(mod) " : "", recent[i].path, (unsigned long long)recent[i].bytes);
+    }
+    pthread_mutex_unlock(&recent_lock);
+}
 
 // ------------------------------------------------------------------ IStorage (raw RomFS image)
 typedef struct { int fd; uint64_t size; } Storage;
@@ -412,6 +439,7 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
                 last = now;
                 if (ENV("LARECOMP_LOG_FILES")) LOG("[fs] read %s%s\n", mod ? "(mod) " : "", now);
             }
+            if (now) recent_note(now, mod != NULL, size);
         }
         static uint64_t reads, bytes;
         reads++;

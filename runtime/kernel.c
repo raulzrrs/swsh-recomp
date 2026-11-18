@@ -920,6 +920,8 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         if (x[2] == 4 && x[1] >= GUEST_LO && x[1] < GUEST_HI) {  // the info is the failing nn::Result
             uint32_t res = *(uint32_t *)(uintptr_t)x[1];
             LOG("[kernel] svcBreak result %#x = %04u-%04u\n", res, 2000 + (res & 0x1FF), (res >> 9) & 0x1FFF);
+            extern void fs_dump_recent(void);  // (runtime/services/fs.c)
+            if ((res & 0x1FF) == 2) fs_dump_recent();  // (module 2, a file system error: which files were read last)
         }
         FATAL("svcBreak(reason=%llx, info=%llx, size=%llx) at %llx\n", x[0], x[1], x[2], pc);
     case 0x27: debug_string(x[0], x[1]); x[0] = R_OK; break;
