@@ -47,8 +47,10 @@ Everything stays in this folder: settings (larecomp.ini), saves (save-sword\ or 
 
 Expansion Pass (optional)
 -------------------------
-Not set up by the launcher yet: each DLC's RomFS has to be packed into extracted\aoc\<data id>.bin. See
-docs/DIAGNOSTICO-SWSH.md on the project page.
+Not set up by the launcher yet. Extract each DLC's RomFS (a keyfile.dat) with the tool you used for the game and put
+it in extracted\aoc\<data id>\ : 0100abf008969001 = The Isle of Armor, 0100abf008969002 = The Crown Tundra
+(extracted\aoc\0100abf008969001\keyfile.dat). The game packs it at the next start. The DLC areas themselves come
+with the 1.3.x update: set the game up from 1.3.2. Packages (.nsp, .nca) are not opened.
 
 Controls
 --------

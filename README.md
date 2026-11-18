@@ -101,8 +101,10 @@ links what was prepared; what isn't in the game files is still compiled when fir
 - During the first start's shader preparation the game runs slower, and a few shaders (those not in the game files)
   still hitch the first time they are seen
 - At 60 fps the crowd on the title screen flickers (an animation counted in frames)
-- The Expansion Pass is not set up by the launcher yet: each DLC's RomFS has to be packed by hand into
-  `extracted/aoc/<data id>.bin` ([docs/DIAGNOSTICO-SWSH.md](docs/DIAGNOSTICO-SWSH.md))
+- The Expansion Pass is not set up by the launcher yet: extract each DLC's RomFS (a `keyfile.dat`) with the tool you
+  used for the game and put it in `extracted/aoc/<data id>/` (`0100abf008969001` The Isle of Armor,
+  `0100abf008969002` The Crown Tundra); the game packs it at the next start. The DLC areas come with the 1.3.x
+  update, which the game must be set up from. `.nsp` / `.nca` packages are not opened
 - Memory use grows slowly over long sessions (being investigated)
 - Only tested on an NVIDIA GPU (RTX 3080): AMD, Intel and integrated GPUs are not tested yet; reports are welcome
 - Online features (raids with other players, trades, Y-Comm) are not supported

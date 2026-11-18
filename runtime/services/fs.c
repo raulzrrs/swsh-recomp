@@ -460,9 +460,42 @@ static void aoc_dir(char *out, size_t n) {
     else snprintf(out, n, "aoc");
 }
 
+// A DLC brought as its RomFS folder (issue #19: what a dump tool extracts, Sword's is a keyfile.dat alone):
+// aoc/<data id>[ anything]/ (or the romfs/ inside it) is packed into aoc/<data id>.bin, once.
+static void aoc_pack_folders(const char *dir, uint64_t base_id) {
+    DIR *d = opendir(dir);
+    if (!d) return;
+    for (struct dirent *e; (e = readdir(d));) {
+        unsigned long long id;
+        int used = 0;
+        if (sscanf(e->d_name, "%16llx%n", &id, &used) != 1 || used != 16) {
+            if (e->d_name[0] != '.')  // (a package or a loose keyfile.dat: which DLC it is can't be told)
+                LOG("[aoc] %s/%s is not read: each DLC goes in aoc/<data id>/ (its RomFS folder, the keyfile.dat) or "
+                    "aoc/<data id>.bin; packages (.nsp, .nca) are not opened\n", dir, e->d_name);
+            continue;
+        }
+        if (id <= base_id || id > base_id + 0xFFF) continue;
+        char src[1100], bin[1100], why[256];
+        struct stat sb;
+        snprintf(src, sizeof src, "%s/%s", dir, e->d_name);
+        if (stat(src, &sb) != 0 || !S_ISDIR(sb.st_mode)) continue;
+        snprintf(bin, sizeof bin, "%s/%016llx.bin", dir, id);
+        if (stat(bin, &sb) == 0) continue;  // (already packed, or brought as an image)
+        size_t l = strlen(src);
+        snprintf(src + l, sizeof src - l, "/romfs");
+        if (stat(src, &sb) != 0 || !S_ISDIR(sb.st_mode)) src[l] = 0;
+        if (!romfs_dir_bytes(src)) { LOG("[aoc] %s: no files in it\n", src); continue; }
+        if (romfs_build(src, bin, NULL, why, sizeof why)) LOG("[aoc] packed the DLC folder %s into %s\n", src, bin);
+        else { LOG("[aoc] could not pack %s: %s\n", src, why); remove(bin); }
+    }
+    closedir(d);
+}
+
 int aoc_list(uint64_t base_id, uint32_t *indices, int max) {
     char dir[1024];
     aoc_dir(dir, sizeof dir);
+    static uint64_t packed_for;  // (once per game: a reboot into the other one looks again)
+    if (packed_for != base_id) { packed_for = base_id; aoc_pack_folders(dir, base_id); }
     DIR *d = opendir(dir);
     if (!d) return 0;
     int n = 0;
