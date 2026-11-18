@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.1 (2026-11-18)
+
+Fixes for AMD and Intel graphics, the Battle Tower and the Expansion Pass. Not yet confirmed on the players' own
+AMD and Intel PCs (the reference PC has an NVIDIA card): reports are welcome.
+
+### Fixes
+- **AMD Radeon: striped characters and white eyes** (#4, #20, #22). The game computes the change of a value between
+  neighbouring pixels itself in 189 shaders (characters among them), by exchanging values inside each 2x2 block of
+  pixels; the exchange was translated as a generic one, which on AMD's driver read garbage on every block a triangle's
+  edge cuts - most of a character's small triangles. It is now the 2x2 block exchange Vulkan has for it. On NVIDIA the
+  image is unchanged.
+- **Integrated Intel GPUs: crashes after a few seconds or minutes** (#21, #9: `vkEndCommandBuffer ... failed: -2`,
+  `pipeline creation failed: -2`, a crash inside `igvk64.dll`). The game's 3.2 GB of memory were shared with the GPU,
+  which on an integrated GPU (half the system RAM: ~4 GB with 8 GB) left too little for its textures and work. On an
+  integrated GPU 1.5 GB of its memory are now left free (`LARECOMP_VK_GMEM_RESERVE_MB` changes it).
+- **The Battle Tower no longer crashes** after choosing a team (#18, `2002-6905`): the console's word filter was
+  asked its version through a path 0.2.0's fix didn't cover.
+
+### Expansion Pass
+- **A DLC can be brought as its folder** (#19): extract each DLC's RomFS (a `keyfile.dat`) with the tool you used for
+  the game into `extracted/aoc/0100abf008969001/` (The Isle of Armor) and `extracted/aoc/0100abf008969002/` (The Crown
+  Tundra); the game packs it at the next start. The DLC areas come with the 1.3.x update, which the game must be set
+  up from. Anything else put there (a loose `keyfile.dat`, `.nsp` / `.nca` packages) is named in the log.
+
+### For testers and developers
+- A crash on a file system error (`2002-xxxx`) lists the last 8 files read in the log, a mod's with its size on the
+  disk (#17).
+
 ## 0.3.0 (2026-11-15)
 
 Better graphics and a real PC mouse: anti-aliasing with TAA or NVIDIA DLAA, ambient occlusion, sharper sun shadows,
