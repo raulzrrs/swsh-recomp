@@ -1628,6 +1628,15 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         int pd = (int)bits(w, 48, 3);
         if (c->stage == STAGE_VERTEX) {
             set_reg(c, d, R(a));  // no SIMD-group functions in vertex functions: lane-local value
+        } else if (c->glsl && c->stage == STAGE_FRAGMENT && mode == 3 && bits(w, 28, 1) && bits(w, 20, 5) >= 1 && bits(w, 20, 5) <= 3) {
+            // A butterfly with lane mask 1 / 2 / 3 in a fragment shader is the game's own derivative (with FSWZADD: fwidth,
+            // dFdx / dFdy): the neighbour in the 2x2 quad. As a quad swap, not a generic subgroup xor: the driver must then
+            // run the quad's helper invocations (the pixels of a quad off the triangle). AMD's compiler leaves them off
+            // for a generic shuffle, which then reads garbage on every quad a triangle's edge cuts - the characters'
+            // striped look and white eyes on Radeon GPUs (issues #4, #20, #22: small triangles are mostly edges).
+            static const char *const qs[] = {"", "subgroupQuadSwapHorizontal", "subgroupQuadSwapVertical", "subgroupQuadSwapDiagonal"};
+            sprintf(t, "%s(%s)", qs[bits(w, 20, 5)], R(a));
+            set_reg(c, d, t);
         } else if (c->glsl) {  // a quad xor (lane mask < 4) is the subgroup xor within the quad
             static const char *const fn[] = {"subgroupShuffle", "subgroupShuffleUp", "subgroupShuffleDown", "subgroupShuffleXor"};
             sprintf(t, "%s(%s, uint(%s))", fn[mode], R(a), bv);
@@ -1808,6 +1817,7 @@ static const char glsl_prelude[] =
     "#extension GL_KHR_shader_subgroup_basic : require\n"
     "#extension GL_KHR_shader_subgroup_shuffle : require\n"
     "#extension GL_KHR_shader_subgroup_shuffle_relative : require\n"
+    "#extension GL_KHR_shader_subgroup_quad : require\n"
     "#extension GL_EXT_texture_shadow_lod : require\n"
     "#define cbr(cb, off) cb[min((off) >> 4, uint(cb.length() - 1))][((off) >> 2) & 3u]\n"
     "uint as_u(float x) { return floatBitsToUint(x); }\n"
