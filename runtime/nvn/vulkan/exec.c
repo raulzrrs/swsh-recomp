@@ -3207,11 +3207,40 @@ static bool gmem_import(uint64_t size) {
 static uint64_t gmem_tried;  // heap size the import was last attempted for (gmem_info imports / re-imports)
 static uint64_t gmem_cap = HEAP_MAX;  // the largest import the driver takes, once it has refused one
 
+// On an integrated GPU the import pins pages of the one memory pool the GPU has (half the system RAM, ~4 GB with 8 GB):
+// the driver takes ~3 GB of it and then textures, pipelines and submissions fail with VK_ERROR_OUT_OF_DEVICE_MEMORY or
+// crash inside the driver (issues #9, #21: Intel HD 630 / Iris Xe). The import then leaves a reserve of that pool for the
+// rest; what lies past its end is copied (vertices) or reads zero (global memory). LARECOMP_VK_GMEM_RESERVE_MB=<n> sets
+// the reserve (0: none); a discrete GPU has its own memory and is not capped.
+static uint64_t gmem_pool_cap(void) {
+    VkPhysicalDeviceProperties p;
+    vkGetPhysicalDeviceProperties(g_vk.phys, &p);
+    const char *rv = getenv("LARECOMP_VK_GMEM_RESERVE_MB");
+    if (p.deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && !rv) return HEAP_MAX;
+    uint64_t reserve = rv ? (uint64_t)atoll(rv) << 20 : 0x60000000ull;  // (1.5 GB)
+    if (!reserve) return HEAP_MAX;
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+    uint64_t pool = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
+        if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > pool) pool = mp.memoryHeaps[i].size;
+    if (!pool || pool >= HEAP_MAX + reserve) return HEAP_MAX;
+    uint64_t cap = pool > reserve * 2 ? pool - reserve : pool / 2;  // (a small pool: half of it)
+    cap = cap / GMEM_STEP * GMEM_STEP;
+    if (cap < GMEM_MIN) cap = GMEM_MIN;
+    LOG("[vk] guest heap import: the GPU shares %llu MB of memory, the import is kept to %llu MB\n",
+        (unsigned long long)(pool >> 20), (unsigned long long)(cap >> 20));
+    return cap;
+}
+
 // A driver may refuse the whole heap (issue #49: all the game's text is drawn from storage buffers, ~1.4-1.65 GB into the heap, so
 // without the import it is blank): the import then covers less, from the heap's start. Reads past its end return zero (robustBufferAccess).
 static VkDescriptorBufferInfo gmem_info(void) {
     static int off = -1;
-    if (off < 0) off = getenv("LARECOMP_VK_NO_GMEM") != NULL || !g_vk.host_import;
+    if (off < 0) {
+        off = getenv("LARECOMP_VK_NO_GMEM") != NULL || !g_vk.host_import;
+        if (!off) gmem_cap = gmem_pool_cap();
+    }
     uint64_t want = (kernel_heap_size() + 0xFFFF) & ~0xFFFFull;
     if (want > gmem_cap) want = gmem_cap;
     if (!off && want > gmem_size && !gmem_import(want)) {
