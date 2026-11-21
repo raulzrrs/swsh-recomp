@@ -1,0 +1,4 @@
+{"description": "Issue #26: a wild battle (openworld save: a Lv 60 Electrike at full HP), then the Poke Balls thrown (X, A) one after another: the crash came when the Pokemon broke out",
+ "save": "build/scenario-saves/openworld",
+ "input": "600:A:8,800:A:8,1000:A:8,1200:A:8,1400:B:8,1500:X:8,1580:A:8,2100:A:8,2200:A:8,2300:X:8,2380:A:8,2900:A:8,3000:A:8,3100:X:8,3180:A:8,3700:A:8,3800:A:8,3900:X:8,3980:A:8",
+ "exit_at": 4600, "measure": [1050, 4590], "shots": [1700, 1850, 2000, 2150, 2450, 2700, 3250, 3500, 4100, 4400]}
