@@ -3207,11 +3207,15 @@ static bool gmem_import(uint64_t size) {
 static uint64_t gmem_tried;  // heap size the import was last attempted for (gmem_info imports / re-imports)
 static uint64_t gmem_cap = HEAP_MAX;  // the largest import the driver takes, once it has refused one
 
-// On an integrated GPU the import pins pages of the one memory pool the GPU has (half the system RAM, ~4 GB with 8 GB):
-// the driver takes ~3 GB of it and then textures, pipelines and submissions fail with VK_ERROR_OUT_OF_DEVICE_MEMORY or
-// crash inside the driver (issues #9, #21: Intel HD 630 / Iris Xe). The import then leaves a reserve of that pool for the
-// rest; what lies past its end is copied (vertices) or reads zero (global memory). LARECOMP_VK_GMEM_RESERVE_MB=<n> sets
-// the reserve (0: none); a discrete GPU has its own memory and is not capped.
+// On an integrated GPU the import pins pages of the memory pool it comes from, which the GPU also needs for everything
+// else (Intel: one pool, half the system RAM, ~4 GB with 8 GB): the driver took ~3 GB of it and then textures, pipelines
+// and submissions failed with VK_ERROR_OUT_OF_DEVICE_MEMORY or crashed inside the driver (issues #9, #21: Intel HD 630 /
+// Iris Xe). The import then leaves a reserve of that pool for the rest; what lies past its end is copied (vertices) or
+// reads zero (global memory). The pool is the heap of the memory type the driver gives the host pointer - not the
+// largest device-local heap: on an AMD APU that is the BIOS's carve-out (~2 GB), the import comes from system memory, and
+// 0.3.1 kept it to 768 MB, which cut off the game's text (#27, #4). Never below GMEM_TEXT, which covers it.
+// LARECOMP_VK_GMEM_RESERVE_MB=<n> sets the reserve (0: none); a discrete GPU has its own memory and is not capped.
+#define GMEM_TEXT 0x80000000ull  // (2 GB: the text is drawn from ~1.4-1.65 GB into the heap)
 static uint64_t gmem_pool_cap(void) {
     VkPhysicalDeviceProperties p;
     vkGetPhysicalDeviceProperties(g_vk.phys, &p);
@@ -3219,16 +3223,20 @@ static uint64_t gmem_pool_cap(void) {
     if (p.deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && !rv) return HEAP_MAX;
     uint64_t reserve = rv ? (uint64_t)atoll(rv) << 20 : 0x60000000ull;  // (1.5 GB)
     if (!reserve) return HEAP_MAX;
+    PFN_vkGetMemoryHostPointerPropertiesEXT props =
+        (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(g_vk.dev, "vkGetMemoryHostPointerPropertiesEXT");
+    VkMemoryHostPointerPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (!props || props(g_vk.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, (void *)(uintptr_t)HEAP_BASE, &hp) != VK_SUCCESS ||
+        !hp.memoryTypeBits)
+        return HEAP_MAX;  // (gmem_import says why)
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
-    uint64_t pool = 0;
-    for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
-        if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > pool) pool = mp.memoryHeaps[i].size;
+    uint64_t pool = mp.memoryHeaps[mp.memoryTypes[__builtin_ctz(hp.memoryTypeBits)].heapIndex].size;  // (the type gmem_import uses)
     if (!pool || pool >= HEAP_MAX + reserve) return HEAP_MAX;
     uint64_t cap = pool > reserve * 2 ? pool - reserve : pool / 2;  // (a small pool: half of it)
     cap = cap / GMEM_STEP * GMEM_STEP;
-    if (cap < GMEM_MIN) cap = GMEM_MIN;
-    LOG("[vk] guest heap import: the GPU shares %llu MB of memory, the import is kept to %llu MB\n",
+    if (cap < GMEM_TEXT) cap = GMEM_TEXT;
+    LOG("[vk] guest heap import: the GPU takes it from %llu MB of memory, the import is kept to %llu MB\n",
         (unsigned long long)(pool >> 20), (unsigned long long)(cap >> 20));
     return cap;
 }
