@@ -180,7 +180,7 @@ mediram estão em `reports/cycles/` e em [docs/engineering](engineering/README.m
 | `python tools/swsh/shader_store.py inventory <romfs> <exefs> [<imagem romfs .bin>] ... --out <pasta>` / `coverage <pasta> <pipeline_recipes>` | os estágios de shader dos arquivos do jogo, e quantos dos de uma sessão real eles cobrem (97,5% no Sword) |
 | `LARECOMP_WORKER_BG=0` | as threads de compilação na prioridade normal (padrão: abaixo do jogo) |
 | `LARECOMP_GMEM_EARLY=0` | a memória do jogo vista pela GPU importada no primeiro draw que a usa, não no boot |
-| `LARECOMP_VK_GMEM_RESERVE_MB=<n>` | quanto da memória de uma GPU integrada o import da memória do jogo deixa livre (padrão 1536; 0: nenhum limite); numa GPU dedicada, força o mesmo cálculo |
+| `LARECOMP_VK_GMEM_RESERVE_MB=<n>` | quanto da memória de uma GPU integrada o import da memória do jogo deixa livre (padrão 1536, nunca abaixo de 2 GB de import; 0: nenhum limite); numa GPU dedicada, força o mesmo cálculo |
 | `LARECOMP_VK_GMEM_MAX_MB=<n>` | o driver "recusa" imports maiores que isso (testa o caminho do import menor, `gmem_info`) |
 | `LARECOMP_PCACHE=0`, `LARECOMP_PCACHE_MB=<n>` (1024) | sem as cópias persistentes de vértices / índices na VRAM; o teto delas |
 | `LARECOMP_WRITE_WATCH=0` | a memória do jogo sem write watch (sem ele as cópias persistentes ficam desligadas) |

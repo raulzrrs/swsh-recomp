@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.2 (2026-11-21)
+
+A fix for 0.3.1: **the text is back on AMD integrated GPUs** (Radeon Vega 6 / 7 / 8, #27, #4). 0.3.1's memory limit for
+integrated GPUs measured the wrong memory on AMD (the part the BIOS reserves for graphics, ~2 GB, instead of the
+system memory the game's memory is shared from) and shared only 768 MB of it with the GPU, which cut off the text.
+The limit now uses the memory the sharing really comes from and never goes below 2 GB.
+
+Not fixed yet: the stripes on characters on AMD GPUs (#4, #20, #22) - 0.3.1's change didn't remove them.
+
 ## 0.3.1 (2026-11-18)
 
 Fixes for AMD and Intel graphics, the Battle Tower and the Expansion Pass. Not yet confirmed on the players' own
