@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.3 (2026-11-21)
+
+### Fixes
+- **Poke Jobs (and anything else timed by the game) count the time again** (#25: always "24 hours left"). The game
+  takes a snapshot of the clock when a job starts and measures the time spent against a later one; the port answered
+  the snapshot request with an empty one, in which no time ever passed. The clock the game uses to measure elapsed
+  time also goes on across sessions and PC restarts now (a restart set it back, which a game reads as the clock turned
+  back by hand).
+
+### For testers and developers
+- `LARECOMP_FIXED_TIME` gives the same game time in every run (it added the PC's uptime): scenario images and their
+  checks no longer change with the time of day.
+
 ## 0.3.2 (2026-11-21)
 
 A fix for 0.3.1: **the text is back on AMD integrated GPUs** (Radeon Vega 6 / 7 / 8, #27, #4). 0.3.1's memory limit for

@@ -10,7 +10,6 @@ O estado vivo fica em `.agent/backlog.json` (`python tools/agent/supervisor.py s
 | G3 | P1 | Arquibancada piscando no título | só no **modo 60 fps**: a plateia (passe 10) troca de quadro de animação a cada quadro (animação contada em quadros, dobrada pelo modo 60); a 30 fps não ocorre. `tests/regression/title60.json` | não é erro do renderer; ajuste específico do modo 60 (60MODE-ANIM) |
 | DYNRES | P2 | O jogo desenha a cena a 80% no mundo aberto (1536x864 em alvo 1920x1080) | F9 em `build/logs/sword-20261018-145705.log` | comportamento do jogo; paliativo: render 1440p |
 | PERF60 | P1 | 60 fps a 1440p: P95 / P99 ainda acima da meta | interiores 60; mundo aberto parado ~33 -> 60 fps (`2016be2`, `8a642f1`; `reports/cycles/003.md`); P95 18,9 ms, P99 20,2 ms | render thread corrigida no ciclo 4 (`reports/cycles/004.md`): sem limite, panorâmica 76,5 -> 97,5 fps; resta P95 / P99 |
-| TESTCLOCK | P3 | A luma do quarto nos testes varia com a hora real apesar de LARECOMP_FIXED_TIME (123,0 / 125,4 / 122,7) | `reports/cycles/004.md` | a investigar; os limites das regressões passam |
 | HEAPIMPORT | P3 | Hitch de ~250 ms na primeira importação do heap do guest (3,2 GB) para memória global | `reports/cycles/004.md` | fazer no carregamento |
 | STAB | P2 | Sessões longas e salvar/carregar sem teste formal | — | NÃO TESTADO |
 | LOADS | P3 | Travadas de 200-250 ms ao carregar uma área / um save (tela em fade, poucos draws) | sem capturas de tela (as dos cenários custam ~0,5 s cada e pareciam travadas do jogo): a thread principal espera e uma thread do jogo faz a montagem da cena; 45% dela numa função de seno/cosseno traduzida (`f_70018e6130`, operações de ponto flutuante com checagens de FPCR). `-O2` no jogo todo (21/10): carregamento 228 -> 196-213 ms, 60 fps e folga sem limite iguais, compilação 20 -> 43 min: não adotado | o que resta é o carregamento do próprio jogo; ganhos maiores pedem mudar o código de ponto flutuante que o lifter gera |
@@ -27,6 +26,7 @@ O estado vivo fica em `.agent/backlog.json` (`python tools/agent/supervisor.py s
 | BARRIER | `CMD_BARRIER` gravado e ignorado | `80eef24` | regressões gerais; A/B sem custo |
 | KWAIT | Esperas temporizadas de 1-8 ms duravam ~16 ms (MinGW + Windows) | `27006f3` | `tests/runtime/timed_wait_test.c` |
 | TITLE-EXIT | Mortes com código 1: `taskkill /IM lasrecomp.exe` de outro projeto (letsgo `tools/trace_run.sh`) derrubava todo runtime da máquina | `16ee01b` (nosso script) + `scenario.py` repete em EXTERNAL-KILL | — (o script do letsgo-recomp ainda faz isso) |
+| TESTCLOCK | Com `LARECOMP_FIXED_TIME` o relógio somava o uptime do PC (o steady clock era o tick do sistema desde o boot do PC), então a hora do jogo, e a luz da cena, mudava entre rodadas | `13a2553` (steady clock = relógio do host na primeira leitura + tick desde então) | `tests/regression/room.json`: 122,7 em duas rodadas seguidas |
 
 ## Fora do escopo / NÃO TESTADO
 - Pokémon Shield (sem dump).
